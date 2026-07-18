@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+
+set -e
 
 ZIP_URL="https://raw.githubusercontent.com/parhampahlevann/back/main/backhaul-core.zip"
 
 cd /root
 
-echo "[1/4] Downloading..."
+echo "Downloading backhaul-core..."
 
 rm -rf backhaul-core
 rm -f backhaul-core.zip
@@ -15,13 +16,9 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
     wget -qO backhaul-core.zip "$ZIP_URL"
 else
-    echo "Please install curl or wget."
-    exit 1
-fi
-
-if [ ! -f backhaul-core.zip ]; then
-    echo "Download failed!"
-    exit 1
+    apt-get update
+    apt-get install -y curl
+    curl -fsSL "$ZIP_URL" -o backhaul-core.zip
 fi
 
 if ! command -v unzip >/dev/null 2>&1; then
@@ -29,13 +26,12 @@ if ! command -v unzip >/dev/null 2>&1; then
     apt-get install -y unzip
 fi
 
-echo "[2/4] Extracting..."
-unzip -oq backhaul-core.zip
+echo "Extracting..."
+unzip -o backhaul-core.zip
 
-echo "[3/4] Setting permissions..."
-chmod +x /root/backhaul-core/backhaul.sh
-chmod +x /root/backhaul-core/backhaul_premium
+cd backhaul-core
 
-echo "[4/4] Starting..."
-cd /root/backhaul-core
+chmod +x backhaul.sh
+chmod +x backhaul_premium
+
 exec ./backhaul.sh
