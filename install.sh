@@ -2,36 +2,31 @@
 
 set -e
 
-ZIP_URL="https://raw.githubusercontent.com/parhampahlevann/back/main/backhaul-core.zip"
+echo "=============================="
+echo " Backhaul Installer"
+echo "=============================="
+echo
+echo "1) Install OUT Server (Client)"
+echo "2) Install IR Server (Server)"
+echo
 
-cd /root
+read -p "Choose option [1-2]: " choice
 
-echo "Downloading backhaul-core..."
+case $choice in
 
-rm -rf backhaul-core
-rm -f backhaul-core.zip
+1)
+    echo "Starting OUT installation..."
+    bash <(curl -fsSL https://raw.githubusercontent.com/parhampahlevann/back/main/install-out.sh)
+    ;;
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$ZIP_URL" -o backhaul-core.zip
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO backhaul-core.zip "$ZIP_URL"
-else
-    apt-get update
-    apt-get install -y curl
-    curl -fsSL "$ZIP_URL" -o backhaul-core.zip
-fi
+2)
+    echo "Starting IR installation..."
+    bash <(curl -fsSL https://raw.githubusercontent.com/parhampahlevann/back/main/install-ir.sh)
+    ;;
 
-if ! command -v unzip >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y unzip
-fi
+*)
+    echo "Invalid option!"
+    exit 1
+    ;;
 
-echo "Extracting..."
-unzip -o backhaul-core.zip
-
-cd backhaul-core
-
-chmod +x backhaul.sh
-chmod +x backhaul_premium
-
-exec ./backhaul.sh
+esac
