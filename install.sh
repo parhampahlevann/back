@@ -2,8 +2,7 @@
 
 # Backhaul Tunnel Manager (Iran <-> Kharej)
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
-# Optional SSH auto-sync: give it SSH access to the other server and it configures
-# BOTH sides automatically (no manual copy/paste of tokens/ports).
+# Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync — keep it simple.
 # Run as root on Ubuntu.
 
 set -e
@@ -11,6 +10,7 @@ set -e
 REPO="Musixal/Backhaul"
 INSTALL_DIR="/root/backhaul-core"
 STATE_FILE="$INSTALL_DIR/state.env"
+FIXED_TOKEN="123"
 
 if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (sudo)."
@@ -32,7 +32,7 @@ ensure_backhaul_local() {
         return
     fi
     echo "Fetching latest official Backhaul release from GitHub..."
-    local arch asset_arch url
+    local arch asset_arch url attempt
     arch=$(uname -m)
     case "$arch" in
         x86_64) asset_arch="amd64" ;;
@@ -46,26 +46,50 @@ ensure_backhaul_local() {
         echo "Could not resolve a release asset automatically."
         read -p "Paste the correct .tar.gz download URL: " url
     fi
-    curl -fsSL -o "$INSTALL_DIR/backhaul.tar.gz" "$url"
+
+    rm -f "$INSTALL_DIR/backhaul.tar.gz"
+    attempt=0
+    until curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url"; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 3 ]; then
+            echo "Download failed after multiple attempts."
+            echo "Check disk space (df -h) and network access, then try again."
+            exit 1
+        fi
+        echo "Retrying download..."
+        sleep 2
+    done
+
+    if [ ! -s "$INSTALL_DIR/backhaul.tar.gz" ]; then
+        echo "Downloaded file is empty — aborting."
+        exit 1
+    fi
+
+    if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" >/dev/null 2>&1; then
+        echo "Downloaded file is not a valid archive — aborting. Try re-running."
+        rm -f "$INSTALL_DIR/backhaul.tar.gz"
+        exit 1
+    fi
+
     tar -xzf "$INSTALL_DIR/backhaul.tar.gz" -C "$INSTALL_DIR"
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
     chmod +x "$INSTALL_DIR/backhaul"
+    echo "Backhaul binary installed."
 }
 
-gen_token() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 24
-    else
-        head -c 32 /dev/urandom | md5sum | cut -d' ' -f1
+ensure_tls_cert_local() {
+    # wss/wssmux require tls_cert/tls_key on the server side.
+    if [ -f "$INSTALL_DIR/server.crt" ] && [ -f "$INSTALL_DIR/server.key" ]; then
+        return
     fi
+    echo "Generating self-signed TLS certificate for wss/wssmux..."
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$INSTALL_DIR/server.key" -out "$INSTALL_DIR/server.crt" \
+        -days 3650 -subj "/CN=backhaul" >/dev/null 2>&1
 }
 
 gen_port() {
     echo $(( (RANDOM % 40000) + 20000 ))
-}
-
-ssh_run() {
-    ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "$1"
 }
 
 # ============================================================
@@ -213,39 +237,12 @@ install_flow() {
             *) echo "Invalid selection.";;
         esac
     done
-    [ "$LOCAL_ROLE" = "Iran" ] && REMOTE_ROLE="Kharej" || REMOTE_ROLE="Iran"
-
-    echo ""
-    read -p "Auto-configure the OTHER ($REMOTE_ROLE) server too via SSH from here? (y/n): " AUTO_SSH
-    if [ "$AUTO_SSH" = "y" ]; then
-        read -p "SSH host/IP of the $REMOTE_ROLE server: " SSH_HOST
-        read -p "SSH user (default root): " SSH_USER
-        SSH_USER=${SSH_USER:-root}
-        read -p "SSH port (default 22): " SSH_PORT
-        SSH_PORT=${SSH_PORT:-22}
-        echo "Testing SSH connection (key-based auth)..."
-        if ! ssh_run "echo ok" >/dev/null 2>&1; then
-            echo "Could not connect with key-based SSH auth."
-            echo "Set up 'ssh-copy-id -p $SSH_PORT ${SSH_USER}@${SSH_HOST}' first, or continue manually."
-            read -p "Continue without auto-sync? (y/n): " FALLBACK
-            [ "$FALLBACK" = "y" ] || return
-            AUTO_SSH="n"
-        else
-            echo "SSH connection OK — will configure both servers automatically."
-        fi
-    fi
 
     LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
     read -p "This server's public IP [${LOCAL_PUBLIC_IP_GUESS}]: " LOCAL_PUBLIC_IP
     LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
 
-    if [ "$AUTO_SSH" = "y" ]; then
-        PEER_PUBLIC_IP_DEFAULT="$SSH_HOST"
-    else
-        PEER_PUBLIC_IP_DEFAULT=""
-    fi
-    read -p "The OTHER server's public IP [${PEER_PUBLIC_IP_DEFAULT}]: " PEER_PUBLIC_IP
-    PEER_PUBLIC_IP=${PEER_PUBLIC_IP:-$PEER_PUBLIC_IP_DEFAULT}
+    read -p "The OTHER server's public IP: " PEER_PUBLIC_IP
 
     echo ""
     echo "Choose transport:"
@@ -261,45 +258,36 @@ install_flow() {
         *) TRANSPORT="wss" ;;
     esac
 
-    # Tunnel port and token MUST match on both sides. To avoid the two sides
-    # silently generating different values (the bug we hit before), only the
-    # Iran side (source of truth) auto-generates them. The Kharej side must
-    # either get them via auto-SSH, or the operator must type in EXACTLY what
-    # the Iran side generated/shows.
+    # Token is fixed (as requested) — same on both servers, no prompt needed.
+    # NOTE: this is much weaker than a random token. Anyone who guesses/knows
+    # "123" can authenticate to your tunnel. Fine for quick testing, but
+    # consider a random token (openssl rand -hex 24) for anything real.
+    TOKEN="$FIXED_TOKEN"
+
+    # Tunnel port still has to match on both sides. Iran picks/generates it;
+    # Kharej must type in EXACTLY the same port Iran is using.
     if [ "$LOCAL_ROLE" = "Iran" ]; then
         TUNNEL_PORT_DEFAULT=$(gen_port)
         read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
         TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
-        TOKEN=$(gen_token)
-    else
-        if [ "$AUTO_SSH" = "y" ]; then
-            TUNNEL_PORT_DEFAULT=$(gen_port)
-            read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
-            TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
-            TOKEN=$(gen_token)
-        else
-            echo ""
-            echo "This value MUST exactly match what the Iran server is using — do not invent a new one."
-            read -p "Enter the tunnel port shown/used on the Iran server: " TUNNEL_PORT
-            read -p "Enter the token shown on the Iran server: " TOKEN
-        fi
-    fi
-
-    if [ "$LOCAL_ROLE" = "Iran" ] || [ "$AUTO_SSH" = "y" ]; then
         read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
-    fi
-
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
         IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
         echo ""
-        echo ">>> Tunnel port: $TUNNEL_PORT"
-        echo ">>> Token: $TOKEN"
-        echo ">>> Copy these EXACTLY when you run this script on the Kharej server."
+        echo ">>> Tunnel port: $TUNNEL_PORT   (token is fixed: $TOKEN)"
+        echo ">>> Enter this EXACT port when you run this script on the Kharej server."
     else
+        echo ""
+        echo "This MUST exactly match the port shown on the Iran server."
+        read -p "Enter the tunnel port used on the Iran server: " TUNNEL_PORT
         KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
     fi
 
     ensure_backhaul_local
+    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
+        if [ "$LOCAL_ROLE" = "Iran" ]; then
+            ensure_tls_cert_local
+        fi
+    fi
 
     if [ "$LOCAL_ROLE" = "Iran" ]; then
         TOML_FILE="$INSTALL_DIR/iran${TUNNEL_PORT}.toml"
@@ -313,6 +301,10 @@ install_flow() {
             echo "channel_size = 2048"
             echo "heartbeat = 40"
             echo "mux_con = 8"
+            if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
+                echo "tls_cert = \"${INSTALL_DIR}/server.crt\""
+                echo "tls_key = \"${INSTALL_DIR}/server.key\""
+            fi
             echo "sniffer = false"
             echo "web_port = 0"
             echo "log_level = \"info\""
@@ -404,136 +396,14 @@ KHAREJ_IP=${KHAREJ_IP}
 TRANSPORT=${TRANSPORT}
 EOF
 
-    if [ "$AUTO_SSH" = "y" ]; then
-        echo ""
-        echo "Configuring the remote ($REMOTE_ROLE) server automatically..."
-
-        REMOTE_SCRIPT="set -e
-mkdir -p ${INSTALL_DIR}
-if [ ! -x ${INSTALL_DIR}/backhaul ]; then
-  ARCH=\$(uname -m)
-  case \"\$ARCH\" in
-    x86_64) ASSET_ARCH=\"amd64\" ;;
-    aarch64) ASSET_ARCH=\"arm64\" ;;
-  esac
-  URL=\$(curl -fsSL \"https://api.github.com/repos/${REPO}/releases/latest\" | grep browser_download_url | grep \"linux_\${ASSET_ARCH}\" | grep -v .sha256 | head -n1 | cut -d '\"' -f4)
-  curl -fsSL -o ${INSTALL_DIR}/backhaul.tar.gz \"\$URL\"
-  tar -xzf ${INSTALL_DIR}/backhaul.tar.gz -C ${INSTALL_DIR}
-  rm -f ${INSTALL_DIR}/backhaul.tar.gz
-  chmod +x ${INSTALL_DIR}/backhaul
-fi
-"
-        if [ "$REMOTE_ROLE" = "Kharej" ]; then
-            REMOTE_SCRIPT="$REMOTE_SCRIPT
-TOML_FILE=${INSTALL_DIR}/kharej${TUNNEL_PORT}.toml
-cat > \$TOML_FILE << TOMLEOF
-[client]
-remote_addr = \"${IRAN_IP}:${TUNNEL_PORT}\"
-transport = \"${TRANSPORT}\"
-token = \"${TOKEN}\"
-connection_pool = 8
-aggressive_pool = false
-keepalive_period = 75
-nodelay = true
-retry_interval = 3
-sniffer = false
-web_port = 0
-log_level = \"info\"
-TOMLEOF
-SERVICE_FILE=/etc/systemd/system/backhaul-kharej${TUNNEL_PORT}.service
-cat > \$SERVICE_FILE << SVCEOF
-[Unit]
-Description=Backhaul Kharej Client Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c \$TOML_FILE
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-systemctl daemon-reload
-systemctl enable --now backhaul-kharej${TUNNEL_PORT}.service
-"
-        else
-            REMOTE_SCRIPT="$REMOTE_SCRIPT
-TOML_FILE=${INSTALL_DIR}/iran${TUNNEL_PORT}.toml
-{
-echo '[server]'
-echo 'bind_addr = \"0.0.0.0:${TUNNEL_PORT}\"'
-echo 'transport = \"${TRANSPORT}\"'
-echo 'token = \"${TOKEN}\"'
-echo 'keepalive_period = 75'
-echo 'nodelay = true'
-echo 'channel_size = 2048'
-echo 'heartbeat = 40'
-echo 'mux_con = 8'
-echo 'sniffer = false'
-echo 'web_port = 0'
-echo 'log_level = \"info\"'
-echo ''
-echo 'ports = ['
-"
-            IFS=',' read -ra PORT_ARRAY <<< "$INBOUND_PORTS"
-            for i in "${!PORT_ARRAY[@]}"; do
-                port=$(echo "${PORT_ARRAY[i]}" | xargs)
-                if [ $((i+1)) -eq ${#PORT_ARRAY[@]} ]; then
-                    REMOTE_SCRIPT="$REMOTE_SCRIPT
-echo '    \"${port}\"'
-"
-                else
-                    REMOTE_SCRIPT="$REMOTE_SCRIPT
-echo '    \"${port}\",'
-"
-                fi
-            done
-            REMOTE_SCRIPT="$REMOTE_SCRIPT
-echo ']'
-} > \$TOML_FILE
-SERVICE_FILE=/etc/systemd/system/backhaul-iran${TUNNEL_PORT}.service
-cat > \$SERVICE_FILE << SVCEOF
-[Unit]
-Description=Backhaul Iran Server Port ${TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c \$TOML_FILE
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-TasksMax=infinity
-LimitMEMLOCK=infinity
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-systemctl daemon-reload
-systemctl enable --now backhaul-iran${TUNNEL_PORT}.service
-"
-        fi
-
-        echo "$REMOTE_SCRIPT" | ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$SSH_PORT" "${SSH_USER}@${SSH_HOST}" "bash -s"
-        echo "Remote ($REMOTE_ROLE) server configured and started."
-    fi
-
     echo ""
     echo "=== Setup Completed! ==="
     echo "Tunnel port: $TUNNEL_PORT"
     echo "Token: $TOKEN"
     echo "Check: systemctl status 'backhaul-*'"
+    if [ "$TOKEN" = "123" ]; then
+        echo "(Reminder: token is the fixed value '123' — fine for testing, weak for production.)"
+    fi
 }
 
 # ============================================================
