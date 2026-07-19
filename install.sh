@@ -86,6 +86,25 @@ show_status() {
             echo ""
         done
     fi
+
+    echo "=== Recent warnings (token mismatch / connection issues) ==="
+    local found_warning=0
+    for u in $units; do
+        local warn
+        warn=$(journalctl -u "$u" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed" | tail -n 3)
+        if [ -n "$warn" ]; then
+            found_warning=1
+            echo "--- $u ---"
+            echo "$warn"
+        fi
+    done
+    if [ "$found_warning" = "0" ]; then
+        echo "None found in the last 20 log lines of each service."
+    else
+        echo ""
+        echo "If you see 'invalid security token', the token in the .toml files on the"
+        echo "two servers does not match — check with: grep token ${INSTALL_DIR}/*.toml"
+    fi
 }
 
 # ============================================================
@@ -242,9 +261,29 @@ install_flow() {
         *) TRANSPORT="wss" ;;
     esac
 
-    TUNNEL_PORT_DEFAULT=$(gen_port)
-    read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
-    TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
+    # Tunnel port and token MUST match on both sides. To avoid the two sides
+    # silently generating different values (the bug we hit before), only the
+    # Iran side (source of truth) auto-generates them. The Kharej side must
+    # either get them via auto-SSH, or the operator must type in EXACTLY what
+    # the Iran side generated/shows.
+    if [ "$LOCAL_ROLE" = "Iran" ]; then
+        TUNNEL_PORT_DEFAULT=$(gen_port)
+        read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
+        TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
+        TOKEN=$(gen_token)
+    else
+        if [ "$AUTO_SSH" = "y" ]; then
+            TUNNEL_PORT_DEFAULT=$(gen_port)
+            read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
+            TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
+            TOKEN=$(gen_token)
+        else
+            echo ""
+            echo "This value MUST exactly match what the Iran server is using — do not invent a new one."
+            read -p "Enter the tunnel port shown/used on the Iran server: " TUNNEL_PORT
+            read -p "Enter the token shown on the Iran server: " TOKEN
+        fi
+    fi
 
     if [ "$LOCAL_ROLE" = "Iran" ] || [ "$AUTO_SSH" = "y" ]; then
         read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
@@ -252,12 +291,13 @@ install_flow() {
 
     if [ "$LOCAL_ROLE" = "Iran" ]; then
         IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
+        echo ""
+        echo ">>> Tunnel port: $TUNNEL_PORT"
+        echo ">>> Token: $TOKEN"
+        echo ">>> Copy these EXACTLY when you run this script on the Kharej server."
     else
         KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
     fi
-
-    TOKEN=$(gen_token)
-    echo "Generated Backhaul token automatically."
 
     ensure_backhaul_local
 
