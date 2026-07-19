@@ -1,22 +1,15 @@
 #!/bin/bash
 
-# Backhaul + WireGuard Tunnel Manager (Iran <-> Kharej)
-# - Official Musixal/Backhaul release binary (encrypted reverse port forwarding, wss/wssmux)
-# - WireGuard private tunnel (10.100.200.1 <-> 10.100.200.2), routed INSIDE the Backhaul
-#   tunnel (accept_udp) instead of exposed directly on the internet — avoids DPI that
-#   fingerprints raw WireGuard handshakes.
-# - Optional SSH auto-sync: give it SSH access to the other server and it configures
-#   BOTH sides automatically (no manual copy/paste of keys/tokens).
+# Backhaul Tunnel Manager (Iran <-> Kharej)
+# Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
+# Optional SSH auto-sync: give it SSH access to the other server and it configures
+# BOTH sides automatically (no manual copy/paste of tokens/ports).
 # Run as root on Ubuntu.
 
 set -e
 
 REPO="Musixal/Backhaul"
 INSTALL_DIR="/root/backhaul-core"
-WG_DIR="/etc/wireguard"
-WG_IFACE="wg0"
-WG_IRAN_IP="10.100.200.1"
-WG_KHAREJ_IP="10.100.200.2"
 STATE_FILE="$INSTALL_DIR/state.env"
 
 if [ "$EUID" -ne 0 ]; then
@@ -30,34 +23,8 @@ mkdir -p "$INSTALL_DIR"
 # Helpers
 # ============================================================
 
-detect_interface() {
-    local ifc
-    ifc=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    if [ -z "$ifc" ]; then
-        ifc=$(ip link show | grep -E 'state UP' | awk -F': ' '{print $2}' | grep -E '^(eth|ens|enp)' | head -n1)
-    fi
-    echo "$ifc"
-}
-
 detect_public_ip() {
     curl -fsSL -4 https://ifconfig.me 2>/dev/null || curl -fsSL -4 https://api.ipify.org 2>/dev/null || echo ""
-}
-
-ensure_wireguard_local() {
-    if ! command -v wg >/dev/null 2>&1; then
-        echo "Installing WireGuard locally..."
-        apt-get update -qq
-        apt-get install -y -qq wireguard >/dev/null
-    fi
-}
-
-ensure_wg_keys_local() {
-    mkdir -p "$WG_DIR"
-    chmod 700 "$WG_DIR"
-    if [ ! -f "$WG_DIR/privatekey" ]; then
-        umask 077
-        wg genkey | tee "$WG_DIR/privatekey" | wg pubkey > "$WG_DIR/publickey"
-    fi
 }
 
 ensure_backhaul_local() {
@@ -107,14 +74,6 @@ ssh_run() {
 
 show_status() {
     echo ""
-    echo "=== WireGuard ==="
-    if ip link show "$WG_IFACE" >/dev/null 2>&1; then
-        wg show "$WG_IFACE"
-    else
-        echo "wg0 is not up."
-    fi
-
-    echo ""
     echo "=== Backhaul services ==="
     local units
     units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
@@ -130,18 +89,85 @@ show_status() {
 }
 
 # ============================================================
+# Manage inbound ports (Iran server side only)
+# ============================================================
+
+manage_ports() {
+    local tomls
+    tomls=$(ls "$INSTALL_DIR"/iran*.toml 2>/dev/null || true)
+    if [ -z "$tomls" ]; then
+        echo "No Iran server config found on this machine. Run this on the Iran server."
+        return
+    fi
+
+    echo "Found config(s):"
+    select TOML_FILE in $tomls; do
+        [ -n "$TOML_FILE" ] && break
+        echo "Invalid selection."
+    done
+
+    echo ""
+    echo "Current ports:"
+    sed -n '/ports = \[/,/\]/p' "$TOML_FILE"
+
+    echo ""
+    echo "1) Add a port"
+    echo "2) Remove a port"
+    read -p "Choice [1-2]: " PCHOICE
+
+    PORT_NUM=$(basename "$TOML_FILE" | grep -oE '[0-9]+' | head -n1)
+    SERVICE_NAME="backhaul-iran${PORT_NUM}.service"
+
+    if [ "$PCHOICE" = "1" ]; then
+        read -p "Port to add: " NEWPORT
+        sed -i "s/\]/    \"${NEWPORT}\"\n]/" "$TOML_FILE"
+        # normalize: ensure previous last line got a trailing comma
+        python3 - "$TOML_FILE" << 'PYEOF' 2>/dev/null || true
+import sys, re
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+lines = content.split("\n")
+out = []
+in_ports = False
+port_lines_idx = []
+for i, l in enumerate(lines):
+    if 'ports = [' in l:
+        in_ports = True
+    if in_ports and l.strip().startswith('"'):
+        port_lines_idx.append(i)
+    if in_ports and l.strip() == ']':
+        in_ports = False
+for idx_pos, i in enumerate(port_lines_idx):
+    l = lines[i].rstrip(',').rstrip()
+    if idx_pos != len(port_lines_idx) - 1:
+        lines[i] = l + ","
+    else:
+        lines[i] = l
+with open(path, "w") as f:
+    f.write("\n".join(lines))
+PYEOF
+        echo "Added port ${NEWPORT}."
+    else
+        read -p "Port to remove: " OLDPORT
+        sed -i "/\"${OLDPORT}\"/d" "$TOML_FILE"
+        echo "Removed port ${OLDPORT}."
+    fi
+
+    systemctl restart "$SERVICE_NAME"
+    echo "Restarted $SERVICE_NAME."
+}
+
+# ============================================================
 # Uninstall
 # ============================================================
 
 uninstall_all() {
-    read -p "This will remove WireGuard tunnel and ALL Backhaul services on THIS server. Continue? (y/n): " CONFIRM
+    read -p "This will remove ALL Backhaul services on THIS server. Continue? (y/n): " CONFIRM
     if [ "$CONFIRM" != "y" ]; then
         echo "Cancelled."
         return
     fi
-
-    systemctl disable --now "wg-quick@${WG_IFACE}" >/dev/null 2>&1 || true
-    rm -f "$WG_DIR/${WG_IFACE}.conf"
 
     local units
     units=$(systemctl list-units --all 'backhaul-*.service' --no-legend 2>/dev/null | awk '{print $1}')
@@ -152,7 +178,7 @@ uninstall_all() {
 
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
-    echo "Uninstalled. (WireGuard package itself was left installed; run 'apt remove wireguard' if you want it fully gone.)"
+    echo "Uninstalled."
 }
 
 # ============================================================
@@ -169,9 +195,6 @@ install_flow() {
         esac
     done
     [ "$LOCAL_ROLE" = "Iran" ] && REMOTE_ROLE="Kharej" || REMOTE_ROLE="Iran"
-
-    INTERFACE=$(detect_interface)
-    echo "Detected local interface: $INTERFACE"
 
     echo ""
     read -p "Auto-configure the OTHER ($REMOTE_ROLE) server too via SSH from here? (y/n): " AUTO_SSH
@@ -206,7 +229,7 @@ install_flow() {
     PEER_PUBLIC_IP=${PEER_PUBLIC_IP:-$PEER_PUBLIC_IP_DEFAULT}
 
     echo ""
-    echo "Choose Backhaul transport:"
+    echo "Choose transport:"
     echo "  1) wss     - TLS encrypted, looks like HTTPS to firewalls (recommended)"
     echo "  2) wssmux  - wss + multiplexing, best for many concurrent connections / high throughput"
     echo "  3) tcp     - plain TCP, fastest but not encrypted or disguised"
@@ -220,21 +243,11 @@ install_flow() {
     esac
 
     TUNNEL_PORT_DEFAULT=$(gen_port)
-    read -p "Backhaul tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
+    read -p "Tunnel port [${TUNNEL_PORT_DEFAULT}]: " TUNNEL_PORT
     TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
 
-    WG_LOCAL_PORT_DEFAULT=51820
-    read -p "WireGuard port, forwarded through the Backhaul tunnel [${WG_LOCAL_PORT_DEFAULT}]: " WG_LOCAL_PORT
-    WG_LOCAL_PORT=${WG_LOCAL_PORT:-$WG_LOCAL_PORT_DEFAULT}
-
     if [ "$LOCAL_ROLE" = "Iran" ] || [ "$AUTO_SSH" = "y" ]; then
-        read -p "Extra inbound ports on the Iran server, if any (comma separated, e.g. 2050,2023 — leave empty if none): " INBOUND_PORTS
-    fi
-    # WireGuard's port always rides inside the Backhaul tunnel too.
-    if [ -n "$INBOUND_PORTS" ]; then
-        INBOUND_PORTS="${INBOUND_PORTS},${WG_LOCAL_PORT}"
-    else
-        INBOUND_PORTS="${WG_LOCAL_PORT}"
+        read -p "Inbound ports on the Iran server (comma separated, e.g. 2050,2023): " INBOUND_PORTS
     fi
 
     if [ "$LOCAL_ROLE" = "Iran" ]; then
@@ -246,63 +259,6 @@ install_flow() {
     TOKEN=$(gen_token)
     echo "Generated Backhaul token automatically."
 
-    # --- local WireGuard keys ---
-    ensure_wireguard_local
-    ensure_wg_keys_local
-    LOCAL_WG_PRIVKEY=$(cat "$WG_DIR/privatekey")
-    LOCAL_WG_PUBKEY=$(cat "$WG_DIR/publickey")
-    [ "$LOCAL_ROLE" = "Iran" ] && LOCAL_WG_IP="$WG_IRAN_IP" && PEER_WG_IP="$WG_KHAREJ_IP"
-    [ "$LOCAL_ROLE" = "Kharej" ] && LOCAL_WG_IP="$WG_KHAREJ_IP" && PEER_WG_IP="$WG_IRAN_IP"
-
-    # --- get / generate peer WireGuard key ---
-    if [ "$AUTO_SSH" = "y" ]; then
-        echo "Preparing WireGuard on the remote ($REMOTE_ROLE) server..."
-        ssh_run "command -v wg >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq wireguard >/dev/null); mkdir -p $WG_DIR && chmod 700 $WG_DIR; if [ ! -f $WG_DIR/privatekey ]; then umask 077; wg genkey | tee $WG_DIR/privatekey | wg pubkey > $WG_DIR/publickey; fi"
-        PEER_WG_PUBKEY=$(ssh_run "cat $WG_DIR/publickey")
-    else
-        echo "Your WireGuard public key (give this to the $REMOTE_ROLE server operator):"
-        echo "  $LOCAL_WG_PUBKEY"
-        read -p "Enter the $REMOTE_ROLE server's WireGuard public key: " PEER_WG_PUBKEY
-    fi
-
-    # --- write + start local WireGuard ---
-    # WireGuard rides INSIDE the Backhaul tunnel:
-    #   - Iran connects out to 127.0.0.1:<WG_LOCAL_PORT>, which Backhaul's server side
-    #     is publicly listening on and relaying to Kharej's local WireGuard socket.
-    #   - Kharej listens passively on <WG_LOCAL_PORT> and has no Endpoint — it just
-    #     waits for the (tunneled) connection to arrive and replies to whatever
-    #     source it sees.
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        WG_OWN_LISTEN_PORT=$((WG_LOCAL_PORT + 1))
-        cat > "$WG_DIR/${WG_IFACE}.conf" << EOF
-[Interface]
-Address = ${LOCAL_WG_IP}/24
-PrivateKey = ${LOCAL_WG_PRIVKEY}
-ListenPort = ${WG_OWN_LISTEN_PORT}
-
-[Peer]
-PublicKey = ${PEER_WG_PUBKEY}
-Endpoint = 127.0.0.1:${WG_LOCAL_PORT}
-AllowedIPs = ${PEER_WG_IP}/32
-PersistentKeepalive = 25
-EOF
-    else
-        cat > "$WG_DIR/${WG_IFACE}.conf" << EOF
-[Interface]
-Address = ${LOCAL_WG_IP}/24
-PrivateKey = ${LOCAL_WG_PRIVKEY}
-ListenPort = ${WG_LOCAL_PORT}
-
-[Peer]
-PublicKey = ${PEER_WG_PUBKEY}
-AllowedIPs = ${PEER_WG_IP}/32
-PersistentKeepalive = 25
-EOF
-    fi
-    chmod 600 "$WG_DIR/${WG_IFACE}.conf"
-
-    # --- local Backhaul (needs to exist BEFORE starting WireGuard on Iran,
-    #     since Iran's WG immediately tries to reach 127.0.0.1:<WG_LOCAL_PORT>) ---
     ensure_backhaul_local
 
     if [ "$LOCAL_ROLE" = "Iran" ]; then
@@ -312,7 +268,6 @@ EOF
             echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
             echo "transport = \"${TRANSPORT}\""
             echo "token = \"${TOKEN}\""
-            echo "accept_udp = true"
             echo "keepalive_period = 75"
             echo "nodelay = true"
             echo "channel_size = 2048"
@@ -358,8 +313,7 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable --now "backhaul-iran${TUNNEL_PORT}.service"
-        echo "Local Backhaul (Iran server side) started on port ${TUNNEL_PORT}, forwarding WireGuard port ${WG_LOCAL_PORT} over the tunnel."
-        sleep 1
+        echo "Local Backhaul (Iran server side) started on port ${TUNNEL_PORT}."
     else
         TOML_FILE="$INSTALL_DIR/kharej${TUNNEL_PORT}.toml"
         cat > "$TOML_FILE" << EOF
@@ -400,59 +354,22 @@ EOF
         systemctl daemon-reload
         systemctl enable --now "backhaul-kharej${TUNNEL_PORT}.service"
         echo "Local Backhaul (Kharej client side) started, connecting to ${IRAN_IP}:${TUNNEL_PORT}."
-        sleep 1
     fi
-
-    # WireGuard starts AFTER Backhaul, since (on Iran) it dials 127.0.0.1:<WG_LOCAL_PORT>
-    # which only exists once Backhaul is up.
-    systemctl enable --now "wg-quick@${WG_IFACE}"
-    echo "Local WireGuard up: ${LOCAL_WG_IP} <-> ${PEER_WG_IP} (tunneled through Backhaul)"
 
     cat > "$STATE_FILE" << EOF
 LOCAL_ROLE=${LOCAL_ROLE}
 TUNNEL_PORT=${TUNNEL_PORT}
-WG_LOCAL_PORT=${WG_LOCAL_PORT}
 IRAN_IP=${IRAN_IP}
 KHAREJ_IP=${KHAREJ_IP}
 TRANSPORT=${TRANSPORT}
 EOF
 
-    # --- remote side, fully automatic ---
     if [ "$AUTO_SSH" = "y" ]; then
         echo ""
         echo "Configuring the remote ($REMOTE_ROLE) server automatically..."
 
-        if [ "$REMOTE_ROLE" = "Kharej" ]; then
-            REMOTE_WG_CONF="[Interface]
-Address = ${PEER_WG_IP}/24
-PrivateKey = \$(cat ${WG_DIR}/privatekey)
-ListenPort = ${WG_LOCAL_PORT}
-
-[Peer]
-PublicKey = ${LOCAL_WG_PUBKEY}
-AllowedIPs = ${LOCAL_WG_IP}/32
-PersistentKeepalive = 25"
-        else
-            REMOTE_WG_OWN_LISTEN_PORT=$((WG_LOCAL_PORT + 1))
-            REMOTE_WG_CONF="[Interface]
-Address = ${PEER_WG_IP}/24
-PrivateKey = \$(cat ${WG_DIR}/privatekey)
-ListenPort = ${REMOTE_WG_OWN_LISTEN_PORT}
-
-[Peer]
-PublicKey = ${LOCAL_WG_PUBKEY}
-Endpoint = 127.0.0.1:${WG_LOCAL_PORT}
-AllowedIPs = ${LOCAL_WG_IP}/32
-PersistentKeepalive = 25"
-        fi
-
         REMOTE_SCRIPT="set -e
 mkdir -p ${INSTALL_DIR}
-cat > ${WG_DIR}/${WG_IFACE}.conf << WGEOF
-${REMOTE_WG_CONF}
-WGEOF
-chmod 600 ${WG_DIR}/${WG_IFACE}.conf
-
 if [ ! -x ${INSTALL_DIR}/backhaul ]; then
   ARCH=\$(uname -m)
   case \"\$ARCH\" in
@@ -466,7 +383,6 @@ if [ ! -x ${INSTALL_DIR}/backhaul ]; then
   chmod +x ${INSTALL_DIR}/backhaul
 fi
 "
-
         if [ "$REMOTE_ROLE" = "Kharej" ]; then
             REMOTE_SCRIPT="$REMOTE_SCRIPT
 TOML_FILE=${INSTALL_DIR}/kharej${TUNNEL_PORT}.toml
@@ -507,8 +423,6 @@ WantedBy=multi-user.target
 SVCEOF
 systemctl daemon-reload
 systemctl enable --now backhaul-kharej${TUNNEL_PORT}.service
-sleep 1
-systemctl enable --now wg-quick@${WG_IFACE}
 "
         else
             REMOTE_SCRIPT="$REMOTE_SCRIPT
@@ -518,7 +432,6 @@ echo '[server]'
 echo 'bind_addr = \"0.0.0.0:${TUNNEL_PORT}\"'
 echo 'transport = \"${TRANSPORT}\"'
 echo 'token = \"${TOKEN}\"'
-echo 'accept_udp = true'
 echo 'keepalive_period = 75'
 echo 'nodelay = true'
 echo 'channel_size = 2048'
@@ -569,8 +482,6 @@ WantedBy=multi-user.target
 SVCEOF
 systemctl daemon-reload
 systemctl enable --now backhaul-iran${TUNNEL_PORT}.service
-sleep 1
-systemctl enable --now wg-quick@${WG_IFACE}
 "
         fi
 
@@ -580,15 +491,9 @@ systemctl enable --now wg-quick@${WG_IFACE}
 
     echo ""
     echo "=== Setup Completed! ==="
-    echo "Backhaul tunnel port: $TUNNEL_PORT"
-    echo "WireGuard port (tunneled): $WG_LOCAL_PORT"
+    echo "Tunnel port: $TUNNEL_PORT"
     echo "Token: $TOKEN"
-    echo "WireGuard: wg show ${WG_IFACE}"
-    echo "Backhaul:  systemctl status 'backhaul-*'"
-    echo ""
-    echo "Note: WireGuard's UDP traffic now rides inside the encrypted Backhaul (${TRANSPORT})"
-    echo "tunnel instead of being exposed directly on the internet — no need to open"
-    echo "${WG_LOCAL_PORT}/udp on either server's firewall."
+    echo "Check: systemctl status 'backhaul-*'"
 }
 
 # ============================================================
@@ -597,17 +502,19 @@ systemctl enable --now wg-quick@${WG_IFACE}
 
 while true; do
     echo ""
-    echo "==== Backhaul + WireGuard Tunnel Manager ===="
+    echo "==== Backhaul Tunnel Manager ===="
     echo "1) Install / Setup tunnel"
     echo "2) Show tunnel status"
-    echo "3) Uninstall tunnel"
-    echo "4) Exit"
-    read -p "Select an option [1-4]: " CHOICE
+    echo "3) Manage inbound ports (Iran side)"
+    echo "4) Uninstall tunnel"
+    echo "5) Exit"
+    read -p "Select an option [1-5]: " CHOICE
     case "$CHOICE" in
         1) install_flow ;;
         2) show_status ;;
-        3) uninstall_all ;;
-        4) exit 0 ;;
+        3) manage_ports ;;
+        4) uninstall_all ;;
+        5) exit 0 ;;
         *) echo "Invalid option." ;;
     esac
 done
