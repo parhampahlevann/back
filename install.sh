@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v5
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v6
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding (wss/wssmux).
 # Includes: fixed shared token, TLS cert auto-gen for wss/wssmux, port management,
 # per-service management console, and a BBR/network system optimizer.
+# (WireGuard-over-relay was tried and dropped — plain Backhaul port forwarding only.)
 # Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync — keep it simple.
 
 set -e
@@ -356,200 +357,6 @@ manage_services() {
         esac
     done
 }
-
-WG_DIR="/etc/wireguard"
-WG_IFACE="wg0"
-WG_IRAN_IP="10.1.1.1"
-WG_KHAREJ_IP="10.1.1.12"
-
-ensure_wireguard_local() {
-    if ! command -v wg >/dev/null 2>&1; then
-        echo "Installing WireGuard..."
-        apt-get update -qq
-        apt-get install -y -qq wireguard >/dev/null
-    fi
-}
-
-ensure_wg_keys_local() {
-    mkdir -p "$WG_DIR"
-    chmod 700 "$WG_DIR"
-    if [ ! -f "$WG_DIR/privatekey" ]; then
-        umask 077
-        wg genkey | tee "$WG_DIR/privatekey" | wg pubkey > "$WG_DIR/publickey"
-    fi
-}
-
-install_wireguard_relay() {
-    echo ""
-    echo "=== WireGuard over a dedicated Backhaul UDP relay ==="
-    echo "This uses Backhaul's native 'udp' transport (a real UDP forwarder), running"
-    echo "as a SEPARATE instance from your main wss tunnel. It does NOT disguise as"
-    echo "HTTPS — it's a plain UDP relay — but WireGuard's own encryption still"
-    echo "protects the actual traffic inside it."
-    echo ""
-
-    echo "Are you setting up the Iran server or the Kharej server?"
-    select LOCAL_ROLE in "Iran" "Kharej"; do
-        case $LOCAL_ROLE in
-            Iran|Kharej) break;;
-            *) echo "Invalid selection.";;
-        esac
-    done
-
-    LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
-    read -p "This server's public IP [${LOCAL_PUBLIC_IP_GUESS}]: " LOCAL_PUBLIC_IP
-    LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
-    read -p "The OTHER server's public IP: " PEER_PUBLIC_IP
-
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        RELAY_TUNNEL_PORT_DEFAULT=$(gen_port)
-        read -p "Relay control port (separate from your main tunnel) [${RELAY_TUNNEL_PORT_DEFAULT}]: " RELAY_TUNNEL_PORT
-        RELAY_TUNNEL_PORT=${RELAY_TUNNEL_PORT:-$RELAY_TUNNEL_PORT_DEFAULT}
-        WG_LOCAL_PORT_DEFAULT=51820
-        read -p "WireGuard port to forward through the relay [${WG_LOCAL_PORT_DEFAULT}]: " WG_LOCAL_PORT
-        WG_LOCAL_PORT=${WG_LOCAL_PORT:-$WG_LOCAL_PORT_DEFAULT}
-        IRAN_IP="$LOCAL_PUBLIC_IP"; KHAREJ_IP="$PEER_PUBLIC_IP"
-        echo ""
-        echo ">>> Relay control port: $RELAY_TUNNEL_PORT"
-        echo ">>> WireGuard port: $WG_LOCAL_PORT"
-        echo ">>> Enter these EXACT values when you run this on the Kharej server."
-    else
-        echo ""
-        echo "These MUST exactly match what you entered on the Iran server."
-        read -p "Enter the relay control port used on the Iran server: " RELAY_TUNNEL_PORT
-        read -p "Enter the WireGuard port used on the Iran server: " WG_LOCAL_PORT
-        KHAREJ_IP="$LOCAL_PUBLIC_IP"; IRAN_IP="$PEER_PUBLIC_IP"
-    fi
-
-    ensure_backhaul_local
-    ensure_wireguard_local
-    ensure_wg_keys_local
-
-    LOCAL_WG_PRIVKEY=$(cat "$WG_DIR/privatekey")
-    LOCAL_WG_PUBKEY=$(cat "$WG_DIR/publickey")
-    [ "$LOCAL_ROLE" = "Iran" ] && LOCAL_WG_IP="$WG_IRAN_IP" && PEER_WG_IP="$WG_KHAREJ_IP"
-    [ "$LOCAL_ROLE" = "Kharej" ] && LOCAL_WG_IP="$WG_KHAREJ_IP" && PEER_WG_IP="$WG_IRAN_IP"
-
-    echo ""
-    echo "Your WireGuard public key (give this to the operator of the other server):"
-    echo "  $LOCAL_WG_PUBKEY"
-    read -p "Enter the OTHER server's WireGuard public key: " PEER_WG_PUBKEY
-
-    # --- dedicated udp-transport Backhaul relay ---
-    if [ "$LOCAL_ROLE" = "Iran" ]; then
-        RELAY_TOML="$INSTALL_DIR/wgrelay-iran${RELAY_TUNNEL_PORT}.toml"
-        {
-            echo "[server]"
-            echo "bind_addr = \"0.0.0.0:${RELAY_TUNNEL_PORT}\""
-            echo "transport = \"udp\""
-            echo "token = \"${FIXED_TOKEN}\""
-            echo "heartbeat = 20"
-            echo "channel_size = 2048"
-            echo "sniffer = false"
-            echo "web_port = 0"
-            echo "log_level = \"info\""
-            echo "ports = ["
-            echo "    \"${WG_LOCAL_PORT}\""
-            echo "]"
-        } > "$RELAY_TOML"
-
-        RELAY_SERVICE="/etc/systemd/system/backhaul-wgrelay-iran${RELAY_TUNNEL_PORT}.service"
-        cat > "$RELAY_SERVICE" << EOF
-[Unit]
-Description=Backhaul WireGuard UDP Relay (Iran) Port ${RELAY_TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${RELAY_TOML}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-wgrelay-iran${RELAY_TUNNEL_PORT}.service"
-        echo "UDP relay (Iran side) started on port ${RELAY_TUNNEL_PORT}, forwarding WireGuard port ${WG_LOCAL_PORT}."
-        sleep 1
-
-        WG_OWN_LISTEN_PORT=$((WG_LOCAL_PORT + 1))
-        cat > "$WG_DIR/${WG_IFACE}.conf" << EOF
-[Interface]
-Address = ${LOCAL_WG_IP}/24
-PrivateKey = ${LOCAL_WG_PRIVKEY}
-ListenPort = ${WG_OWN_LISTEN_PORT}
-
-[Peer]
-PublicKey = ${PEER_WG_PUBKEY}
-Endpoint = 127.0.0.1:${WG_LOCAL_PORT}
-AllowedIPs = ${PEER_WG_IP}/32
-PersistentKeepalive = 25
-EOF
-    else
-        RELAY_TOML="$INSTALL_DIR/wgrelay-kharej${RELAY_TUNNEL_PORT}.toml"
-        cat > "$RELAY_TOML" << EOF
-[client]
-remote_addr = "${IRAN_IP}:${RELAY_TUNNEL_PORT}"
-transport = "udp"
-token = "${FIXED_TOKEN}"
-connection_pool = 4
-aggressive_pool = false
-retry_interval = 3
-sniffer = false
-web_port = 0
-log_level = "info"
-EOF
-        RELAY_SERVICE="/etc/systemd/system/backhaul-wgrelay-kharej${RELAY_TUNNEL_PORT}.service"
-        cat > "$RELAY_SERVICE" << EOF
-[Unit]
-Description=Backhaul WireGuard UDP Relay (Kharej) Port ${RELAY_TUNNEL_PORT}
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${INSTALL_DIR}/backhaul -c ${RELAY_TOML}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable --now "backhaul-wgrelay-kharej${RELAY_TUNNEL_PORT}.service"
-        echo "UDP relay (Kharej side) started, connecting to ${IRAN_IP}:${RELAY_TUNNEL_PORT}."
-        sleep 1
-
-        cat > "$WG_DIR/${WG_IFACE}.conf" << EOF
-[Interface]
-Address = ${LOCAL_WG_IP}/24
-PrivateKey = ${LOCAL_WG_PRIVKEY}
-ListenPort = ${WG_LOCAL_PORT}
-
-[Peer]
-PublicKey = ${PEER_WG_PUBKEY}
-AllowedIPs = ${PEER_WG_IP}/32
-PersistentKeepalive = 25
-EOF
-    fi
-    chmod 600 "$WG_DIR/${WG_IFACE}.conf"
-
-    systemctl enable --now "wg-quick@${WG_IFACE}"
-    echo ""
-    echo "=== WireGuard relay setup complete ==="
-    echo "Local WireGuard IP: ${LOCAL_WG_IP}  (peer: ${PEER_WG_IP})"
-    echo "Check: wg show ${WG_IFACE}"
-    echo "Test once BOTH sides are set up: ping ${PEER_WG_IP}"
-}
-
 # ============================================================
 # Uninstall
 # ============================================================
@@ -771,19 +578,17 @@ while true; do
     echo "3) Manage inbound ports (Iran side)"
     echo "4) Manage services (start/stop/restart/logs/edit)"
     echo "5) System optimizer (BBR + network tuning)"
-    echo "6) Add WireGuard (via dedicated UDP relay)"
-    echo "7) Uninstall tunnel"
-    echo "8) Exit"
-    read -p "Select an option [1-8]: " CHOICE
+    echo "6) Uninstall tunnel"
+    echo "7) Exit"
+    read -p "Select an option [1-7]: " CHOICE
     case "$CHOICE" in
         1) install_flow ;;
         2) show_status ;;
         3) manage_ports ;;
         4) manage_services ;;
         5) optimize_system ;;
-        6) install_wireguard_relay ;;
-        7) uninstall_all ;;
-        8) exit 0 ;;
+        6) uninstall_all ;;
+        7) exit 0 ;;
         *) echo "Invalid option." ;;
     esac
 done
