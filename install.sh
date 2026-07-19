@@ -28,6 +28,7 @@ detect_public_ip() {
 }
 
 ensure_backhaul_local() {
+    mkdir -p "$INSTALL_DIR"
     if [ -x "$INSTALL_DIR/backhaul" ]; then
         return
     fi
@@ -229,6 +230,7 @@ uninstall_all() {
 # ============================================================
 
 install_flow() {
+    mkdir -p "$INSTALL_DIR"
     echo ""
     echo "Are you setting up the Iran server or the Kharej server?"
     select LOCAL_ROLE in "Iran" "Kharej"; do
