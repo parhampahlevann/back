@@ -51,29 +51,40 @@ LOCAL_PUBLIC_IP=""
 _ts() { date '+%H:%M:%S'; }
 info() { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
 ok() { echo -e "${DIM}$(_ts)${NC} ${GREEN}[ OK ]${NC}  $*"; }
-warn() { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*; }
+warn() { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*"; }
 step() { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
 hr() { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
 
 ask() {
-    local var="$1" prompt="$2" default="$3"
+    local var="$1"
+    local prompt="$2"
+    local default="$3"
+    local input
+    
     if [ -n "$default" ]; then
         echo -ne "${YELLOW}?${NC} $prompt [${default}]: "
     else
         echo -ne "${YELLOW}?${NC} $prompt: "
     fi
     read -r input
-    [ -z "$input" ] && [ -n "$default" ] && input="$default"
+    if [ -z "$input" ] && [ -n "$default" ]; then
+        input="$default"
+    fi
     eval "$var=\"$input\""
 }
 
 ask_required() {
-    local var="$1" prompt="$2"
+    local var="$1"
+    local prompt="$2"
+    local val
+    
     while true; do
         ask "$var" "$prompt" ""
-        eval "local val=\$$var"
-        [ -n "$val" ] && break
+        eval "val=\$$var"
+        if [ -n "$val" ]; then
+            break
+        fi
         warn "This field cannot be empty."
     done
 }
@@ -83,16 +94,26 @@ validate_label() {
 }
 
 detect_public_ip() {
-    curl -fsSL -4 https://ifconfig.me 2>/dev/null || \
-    curl -fsSL -4 https://api.ipify.org 2>/dev/null || \
-    echo ""
+    local ip
+    ip=$(curl -fsSL -4 https://ifconfig.me 2>/dev/null)
+    if [ -z "$ip" ]; then
+        ip=$(curl -fsSL -4 https://api.ipify.org 2>/dev/null)
+    fi
+    if [ -z "$ip" ]; then
+        ip=""
+    fi
+    echo "$ip"
 }
 
 detect_default_iface() {
     local iface
-    iface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    [ -z "$iface" ] && iface=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
-    [ -z "$iface" ] && iface="eth0"
+    iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
+    if [ -z "$iface" ]; then
+        iface=$(ip link show 2>/dev/null | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
+    fi
+    if [ -z "$iface" ]; then
+        iface="eth0"
+    fi
     echo "$iface"
 }
 
@@ -113,29 +134,29 @@ optimize_system() {
     info "Interface: $INTERFACE"
 
     step "Enabling BBR congestion control..."
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 && ok "BBR enabled." || warn "BBR not available."
+    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null && ok "BBR enabled." || warn "BBR not available."
 
     step "Tuning network buffers..."
-    sysctl -w net.core.somaxconn=65535 >/dev/null 2>&1 || true
-    sysctl -w net.core.netdev_max_backlog=250000 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 || true
-    sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1 || true
-    sysctl -w net.core.wmem_max=134217728 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" >/dev/null 2>&1 || true
+    sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+    sysctl -w net.core.netdev_max_backlog=250000 2>/dev/null || true
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" 2>/dev/null || true
+    sysctl -w net.core.rmem_max=134217728 2>/dev/null || true
+    sysctl -w net.core.wmem_max=134217728 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" 2>/dev/null || true
 
     step "Tuning TCP timeouts..."
-    sysctl -w net.ipv4.tcp_keepalive_time=60 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_user_timeout=30000 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_low_latency=1 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_time=60 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_user_timeout=30000 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_fin_timeout=15 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_low_latency=1 2>/dev/null || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 2>/dev/null || true
+    sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
 
     cat > /etc/sysctl.d/99-backhaul-tunnel.conf << 'EOF'
 net.core.default_qdisc=fq
@@ -184,7 +205,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now backhaul-mtu.service >/dev/null 2>&1 || true
+    systemctl enable --now backhaul-mtu.service 2>/dev/null || true
     ok "MTU 1400 applied and persisted"
 
     step "Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8..."
@@ -210,7 +231,7 @@ EOF
     if ! grep -q "^fs.file-max" /etc/sysctl.d/99-backhaul-tunnel.conf 2>/dev/null; then
         echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul-tunnel.conf
     fi
-    sysctl -w fs.file-max=2097152 >/dev/null 2>&1 || true
+    sysctl -w fs.file-max=2097152 2>/dev/null || true
 
     if ! grep -q "backhaul limits" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << 'EOF'
@@ -318,7 +339,7 @@ WantedBy=timers.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1 || true
+    systemctl enable --now backhaul-watchdog.timer 2>/dev/null || true
     ok "Watchdog installed - checks every 10s, restarts after ${WATCHDOG_IDLE_THRESHOLD}s idle"
     info "Log: $WATCHDOG_LOG"
 }
@@ -345,20 +366,22 @@ ensure_backhaul_binary() {
         *) error "Unsupported architecture: $arch" ;;
     esac
     
-    url=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    url=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep "browser_download_url" | grep "linux_${asset_arch}" | grep -v ".sha256" \
         | head -n1 | cut -d '"' -f4)
     
     if [ -z "$url" ]; then
         warn "Could not resolve release asset automatically."
-        ask url "Paste the correct .tar.gz download URL: " ""
-        [ -z "$url" ] && error "No URL provided."
+        ask url "Paste the correct .tar.gz download URL" ""
+        if [ -z "$url" ]; then
+            error "No URL provided."
+        fi
     fi
 
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
     
     info "Downloading from: $url"
-    if ! curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url"; then
+    if ! curl -fSL --retry 3 --retry-delay 2 -o "$INSTALL_DIR/backhaul.tar.gz" "$url" 2>/dev/null; then
         error "Download failed after multiple attempts."
     fi
 
@@ -366,11 +389,11 @@ ensure_backhaul_binary() {
         error "Downloaded file is empty."
     fi
 
-    if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" >/dev/null 2>&1; then
+    if ! tar -tzf "$INSTALL_DIR/backhaul.tar.gz" 2>/dev/null; then
         error "Downloaded file is not a valid archive."
     fi
 
-    tar -xzf "$INSTALL_DIR/backhaul.tar.gz" -C "$INSTALL_DIR"
+    tar -xzf "$INSTALL_DIR/backhaul.tar.gz" -C "$INSTALL_DIR" 2>/dev/null
     rm -f "$INSTALL_DIR/backhaul.tar.gz"
     chmod +x "$BINARY"
     
@@ -384,7 +407,7 @@ ensure_tls_cert() {
     info "Generating self-signed TLS certificate for wss/wssmux..."
     openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "$INSTALL_DIR/server.key" -out "$INSTALL_DIR/server.crt" \
-        -days 3650 -subj "/CN=backhaul" >/dev/null 2>&1
+        -days 3650 -subj "/CN=backhaul" 2>/dev/null
     ok "TLS certificate generated."
 }
 
@@ -399,16 +422,21 @@ install_tunnel() {
     
     echo ""
     echo "Are you setting up the Iran server or the Kharej server?"
-    select LOCAL_ROLE in "Iran" "Kharej"; do
-        case $LOCAL_ROLE in
-            Iran|Kharej) break;;
-            *) echo "Invalid selection.";;
-        esac
-    done
+    echo "  1) Iran"
+    echo "  2) Kharej"
+    ask ROLE_CHOICE "Select role" "1"
+    
+    case "$ROLE_CHOICE" in
+        1) LOCAL_ROLE="Iran" ;;
+        2) LOCAL_ROLE="Kharej" ;;
+        *) error "Invalid selection" ;;
+    esac
 
     LOCAL_PUBLIC_IP_GUESS=$(detect_public_ip)
     ask LOCAL_PUBLIC_IP "This server's public IP" "${LOCAL_PUBLIC_IP_GUESS}"
-    LOCAL_PUBLIC_IP=${LOCAL_PUBLIC_IP:-$LOCAL_PUBLIC_IP_GUESS}
+    if [ -z "$LOCAL_PUBLIC_IP" ]; then
+        LOCAL_PUBLIC_IP="$LOCAL_PUBLIC_IP_GUESS"
+    fi
 
     ask_required PEER_IP "The OTHER server's public IP"
 
@@ -433,7 +461,9 @@ install_tunnel() {
     if [ "$LOCAL_ROLE" = "Iran" ]; then
         TUNNEL_PORT_DEFAULT=$(gen_port)
         ask TUNNEL_PORT "Tunnel port" "${TUNNEL_PORT_DEFAULT}"
-        TUNNEL_PORT=${TUNNEL_PORT:-$TUNNEL_PORT_DEFAULT}
+        if [ -z "$TUNNEL_PORT" ]; then
+            TUNNEL_PORT="$TUNNEL_PORT_DEFAULT"
+        fi
         
         ask_required INBOUND_PORTS "Inbound ports on Iran server (comma separated, e.g. 2050,2023)"
         IRAN_IP="$LOCAL_PUBLIC_IP"
@@ -586,7 +616,7 @@ WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1 || true
+    systemctl enable "$SERVICE_NAME" 2>/dev/null || true
     ok "Service installed: $SERVICE_NAME"
 }
 
@@ -603,13 +633,13 @@ start_service() {
 
 ask_watchdog_and_optimizer() {
     echo ""
-    ask RUN_OPT "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n)" "y"
+    ask RUN_OPT "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)" "y"
     if [ "$RUN_OPT" = "y" ] || [ "$RUN_OPT" = "Y" ]; then
         optimize_system
     fi
     
     echo ""
-    ask RUN_WD "Install the watchdog (auto-restart on dead/idle tunnel)? (y/n)" "y"
+    ask RUN_WD "Install the watchdog (auto-restart on dead/idle tunnel)" "y"
     if [ "$RUN_WD" = "y" ] || [ "$RUN_WD" = "Y" ]; then
         setup_watchdog
     fi
@@ -622,14 +652,17 @@ ask_watchdog_and_optimizer() {
 list_services() {
     local found=()
     for cfg in "${INSTALL_DIR}"/*.toml; do
-        [ -f "$cfg" ] || continue
-        local name
-        name=$(basename "$cfg" .toml)
-        if [ -f "/etc/systemd/system/backhaul-${name}.service" ]; then
-            found+=("backhaul-${name}.service")
+        if [ -f "$cfg" ]; then
+            local name
+            name=$(basename "$cfg" .toml)
+            if [ -f "/etc/systemd/system/backhaul-${name}.service" ]; then
+                found+=("backhaul-${name}.service")
+            fi
         fi
     done
-    [ ${#found[@]} -eq 0 ] && return 0
+    if [ ${#found[@]} -eq 0 ]; then
+        return 0
+    fi
     printf '%s\n' "${found[@]}" | sort -u
 }
 
@@ -692,7 +725,11 @@ pick_service() {
     echo -e "  ${BOLD}Available services:${NC}"
     for i in "${!SERVICES[@]}"; do
         local st="stopped"
-        systemctl is-active --quiet "${SERVICES[$i]}" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+        if systemctl is-active --quiet "${SERVICES[$i]}"; then
+            st="${GREEN}running${NC}"
+        else
+            st="${RED}stopped${NC}"
+        fi
         echo -e "    $((i+1)))  ${SERVICES[$i]}   [${st}]"
     done
     echo ""
@@ -713,7 +750,11 @@ service_control() {
 
     echo ""
     local st
-    systemctl is-active --quiet "$svc" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+    if systemctl is-active --quiet "$svc"; then
+        st="${GREEN}running${NC}"
+    else
+        st="${RED}stopped${NC}"
+    fi
     echo -e "  Selected : ${BOLD}${svc}${NC}   [${st}]"
     echo ""
     echo "  1)  Restart"
@@ -767,7 +808,11 @@ service_control() {
             systemctl disable "$svc" && ok "Auto-start disabled."
             ;;
         7)
-            [ -f "$cfg" ] && cat "$cfg" || warn "Config not found."
+            if [ -f "$cfg" ]; then
+                cat "$cfg"
+            else
+                warn "Config not found."
+            fi
             ;;
         8)
             if [ -f "$cfg" ]; then
@@ -776,7 +821,7 @@ service_control() {
                 info "Opening ${cfg} in ${ed} ..."
                 "$ed" "$cfg"
                 echo ""
-                ask DORESTART "Restart the service to apply changes? (y/n)" "y"
+                ask DORESTART "Restart the service to apply changes" "y"
                 if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
                     systemctl restart "${svc}" && ok "Restarted with new config."
                 fi
@@ -787,14 +832,16 @@ service_control() {
         9)
             echo ""
             warn "Will delete: ${svc}"
-            ask CONFIRM "Confirm? (yes/no)" "no"
+            ask CONFIRM "Confirm (yes/no)" "no"
             if [ "$CONFIRM" != "yes" ]; then
                 info "Cancelled."
                 return
             fi
-            systemctl disable --now "$svc" >/dev/null 2>&1 || true
+            systemctl disable --now "$svc" 2>/dev/null || true
             rm -f "/etc/systemd/system/${svc}"
-            [ -f "$cfg" ] && rm -f "$cfg"
+            if [ -f "$cfg" ]; then
+                rm -f "$cfg"
+            fi
             systemctl daemon-reload
             ok "Deleted."
             ;;
@@ -871,7 +918,7 @@ edit_config() {
     "$ed" "$cfg"
 
     echo ""
-    ask DORESTART "Restart the service to apply changes? (y/n)" "y"
+    ask DORESTART "Restart the service to apply changes" "y"
     if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
         step "Restarting ${svc} ..."
         systemctl restart "${svc}"
@@ -911,7 +958,7 @@ uninstall() {
 
     echo ""
     warn "Will stop and remove: ${TARGETS[*]}"
-    ask CONFIRM "Confirm? (yes/no)" "no"
+    ask CONFIRM "Confirm (yes/no)" "no"
     if [ "$CONFIRM" != "yes" ]; then
         info "Cancelled."
         return
@@ -925,7 +972,10 @@ uninstall() {
         
         local cfg_name="${svc_name#backhaul-}"
         local cfg="${INSTALL_DIR}/${cfg_name}.toml"
-        [ -f "$cfg" ] && rm -f "$cfg" && ok "Removed config: $cfg"
+        if [ -f "$cfg" ]; then
+            rm -f "$cfg"
+            ok "Removed config: $cfg"
+        fi
         
         ok "Removed service: $svc_name"
     done
@@ -985,7 +1035,7 @@ show_menu() {
 }
 
 run_action() {
-    ( "$@" )
+    "$@"
     return 0
 }
 
@@ -1002,6 +1052,11 @@ pause() {
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}[ERR ]${NC}  Run as root: sudo bash install.sh"
     exit 1
+fi
+
+# Fix hostname resolution issue
+if ! hostname -f 2>/dev/null >/dev/null; then
+    echo "127.0.0.1 $(hostname)" >> /etc/hosts 2>/dev/null || true
 fi
 
 mkdir -p "$INSTALL_DIR"
