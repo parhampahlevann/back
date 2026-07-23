@@ -57,32 +57,32 @@ error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; exit 1; }
 hr() { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}"; }
 
 ask() {
-    local var="$1"
+    local var_name="$1"
     local prompt="$2"
-    local default="$3"
-    local input
+    local default_value="$3"
+    local user_input
     
-    if [ -n "$default" ]; then
-        echo -ne "${YELLOW}?${NC} $prompt [${default}]: "
+    if [ -n "$default_value" ]; then
+        echo -ne "${YELLOW}?${NC} $prompt [${default_value}]: "
     else
         echo -ne "${YELLOW}?${NC} $prompt: "
     fi
-    read -r input
-    if [ -z "$input" ] && [ -n "$default" ]; then
-        input="$default"
+    read -r user_input
+    if [ -z "$user_input" ] && [ -n "$default_value" ]; then
+        user_input="$default_value"
     fi
-    eval "$var=\"$input\""
+    eval "$var_name=\"$user_input\""
 }
 
 ask_required() {
-    local var="$1"
+    local var_name="$1"
     local prompt="$2"
-    local val
+    local user_input
     
     while true; do
-        ask "$var" "$prompt" ""
-        eval "val=\$$var"
-        if [ -n "$val" ]; then
+        ask "$var_name" "$prompt" ""
+        eval "user_input=\$$var_name"
+        if [ -n "$user_input" ]; then
             break
         fi
         warn "This field cannot be empty."
@@ -94,27 +94,27 @@ validate_label() {
 }
 
 detect_public_ip() {
-    local ip
-    ip=$(curl -fsSL -4 https://ifconfig.me 2>/dev/null)
-    if [ -z "$ip" ]; then
-        ip=$(curl -fsSL -4 https://api.ipify.org 2>/dev/null)
+    local public_ip
+    public_ip=$(curl -fsSL -4 https://ifconfig.me 2>/dev/null)
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -fsSL -4 https://api.ipify.org 2>/dev/null)
     fi
-    if [ -z "$ip" ]; then
-        ip=""
+    if [ -z "$public_ip" ]; then
+        public_ip=""
     fi
-    echo "$ip"
+    echo "$public_ip"
 }
 
 detect_default_iface() {
-    local iface
-    iface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
-    if [ -z "$iface" ]; then
-        iface=$(ip link show 2>/dev/null | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
+    local interface
+    interface=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)
+    if [ -z "$interface" ]; then
+        interface=$(ip link show 2>/dev/null | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
     fi
-    if [ -z "$iface" ]; then
-        iface="eth0"
+    if [ -z "$interface" ]; then
+        interface="eth0"
     fi
-    echo "$iface"
+    echo "$interface"
 }
 
 gen_port() {
