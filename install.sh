@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# DaggerConnect Tunnel Manager — Full Edition
+# DaggerConnect Tunnel Manager - Full Edition
 # Combined DaggerConnect and Backhaul features
+# No license required - Open Source
 
 set -e
 
@@ -206,14 +207,25 @@ EOF
     ok "MTU 1400 applied and persisted"
 
     step "Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8..."
+    
+    # Remove immutable flag if present
+    if [ -f /etc/resolv.conf ]; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+    fi
+    
+    # Remove symlink if exists
     if [ -L /etc/resolv.conf ]; then
         rm -f /etc/resolv.conf
     fi
+    
+    # Write new resolv.conf
     cat > /etc/resolv.conf << 'EOF'
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 nameserver 8.8.8.8
 EOF
+    
+    # Lock the file
     chattr +i /etc/resolv.conf 2>/dev/null || true
     ok "DNS set and locked"
 
@@ -582,23 +594,32 @@ install_certbot() {
     fi
     info "Installing certbot..."
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq
-        apt-get install -y -qq certbot
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq certbot 2>/dev/null || true
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y -q certbot
+        yum install -y -q certbot 2>/dev/null || true
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y -q certbot
+        dnf install -y -q certbot 2>/dev/null || true
     else
-        error "Cannot install certbot - package manager not found."
+        warn "Cannot install certbot - package manager not found. Skipping SSL."
+        return 1
     fi
-    ok "certbot installed."
+    if command -v certbot >/dev/null 2>&1; then
+        ok "certbot installed."
+        return 0
+    else
+        warn "certbot installation failed."
+        return 1
+    fi
 }
 
 obtain_cert_auto() {
     local domain="$1"
     local cert_dir="/etc/letsencrypt/live/${domain}"
 
-    install_certbot
+    if ! install_certbot; then
+        error "certbot installation failed. Please install manually."
+    fi
 
     if ss -tlnp 2>/dev/null | grep -q ':80 '; then
         warn "Port 80 is in use. Trying standalone anyway."
@@ -642,13 +663,15 @@ ask_ssl_server() {
     echo -e "  ${BOLD}SSL Mode:${NC}"
     echo "    1)  Automatic SSL  - Let's Encrypt (certbot)"
     echo "    2)  Custom SSL     - Provide your own cert/key paths"
+    echo "    3)  Skip SSL       - Use plain HTTP/WS"
     echo ""
     while true; do
         ask SSL_CHOICE "SSL Mode" "1"
         case "$SSL_CHOICE" in
             1|auto)   SSL_MODE="auto";   break ;;
             2|custom) SSL_MODE="custom"; break ;;
-            *) warn "Please enter 1 (auto) or 2 (custom)." ;;
+            3|skip)   SSL_MODE="skip";   return ;;
+            *) warn "Please enter 1 (auto), 2 (custom), or 3 (skip)." ;;
         esac
     done
 
@@ -2362,6 +2385,7 @@ show_banner() {
     echo ""
     echo -e "  ${CYAN}${BOLD}DaggerConnect Installer - Full Edition${NC}"
     echo -e "  ${DIM}Combined DaggerConnect and Backhaul features${NC}"
+    echo -e "  ${DIM}No license required - Open Source${NC}"
     echo ""
 }
 
