@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager (Iran <-> Kharej) — v7.2 (Fixed UDP & Shadowsocks/1080)
+# Backhaul Tunnel Manager (Iran <-> Kharej) — v7.3 (Fixed Syntax & UDP)
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding with full UDP support.
 
 set -e
@@ -9,10 +9,6 @@ REPO="Musixal/Backhaul"
 INSTALL_DIR="/root/backhaul-core"
 STATE_FILE="$INSTALL_DIR/state.env"
 FIXED_TOKEN="123"
-WATCHDOG_SCRIPT="$INSTALL_DIR/watchdog.sh"
-WATCHDOG_LOG="$INSTALL_DIR/watchdog.log"
-WATCHDOG_STATE_DIR="$INSTALL_DIR/watchdog-state"
-WATCHDOG_IDLE_THRESHOLD=30
 
 if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (sudo)."
@@ -149,7 +145,7 @@ install_flow() {
     echo "  3) tcp"
     echo "  4) tcpmux"
     read -p "Enter choice [1-4] (default 2): " TRANSPORT_CHOICE
-    case "$TRANSPORT_CHOICE`" in
+    case "$TRANSPORT_CHOICE" in
         1) TRANSPORT="wss" ;;
         3) TRANSPORT="tcp" ;;
         4) TRANSPORT="tcpmux" ;;
@@ -269,7 +265,7 @@ EOF
         systemctl daemon-reload
         systemctl enable --now "backhaul-kharej${TUNNEL_PORT}.service"
         echo "Kharej Backhaul client started with UDP support."
-    }
+    fi
 
     optimize_system
     echo "=== Setup Completed Successfully! ==="
@@ -277,7 +273,7 @@ EOF
 
 while true; do
     echo ""
-    echo "==== Backhaul Tunnel Manager (v7.2 Fixed UDP) ===="
+    echo "==== Backhaul Tunnel Manager (v7.3) ===="
     echo "1) Install / Setup tunnel"
     echo "2) Show tunnel status"
     echo "3) Exit"
