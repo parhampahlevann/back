@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # DaggerConnect Tunnel Manager — Full Edition
-# ترکیبی از DaggerConnect و Backhaul با تمام قابلیت‌ها
+# Combined DaggerConnect and Backhaul features
 
 set -e
 
 # ============================================================
-# تنظیمات رنگ و پایه
+# Color and Base Settings
 # ============================================================
 
 RED='\033[0;31m'
@@ -28,7 +28,7 @@ WATCHDOG_LOG="/etc/DaggerConnect/watchdog.log"
 WATCHDOG_STATE_DIR="/etc/DaggerConnect/watchdog-state"
 WATCHDOG_IDLE_THRESHOLD=30
 
-# متغیرهای عمومی
+# Global variables
 CONFIG=""
 CONFIG_FMT=""
 SERVICE_NAME=""
@@ -46,7 +46,7 @@ PSK=""
 CLIENT_CONN_POOL="8"
 FIXED_TOKEN="123"
 
-# متغیرهای TUN
+# TUN variables
 TUN_ENCAP=""
 TUN_PROFILE=""
 TUN_LOCAL_IP=""
@@ -67,7 +67,7 @@ HTTP_DOMAIN=""
 HTTP_PATH=""
 
 # ============================================================
-# توابع کمکی
+# Helper Functions
 # ============================================================
 
 _ts() { date '+%H:%M:%S'; }
@@ -119,7 +119,7 @@ detect_default_iface() {
 }
 
 # ============================================================
-# بهینه‌سازی سیستم
+# System Optimization
 # ============================================================
 
 optimize_system() {
@@ -131,29 +131,29 @@ optimize_system() {
     info "Interface: $INTERFACE"
 
     step "Enabling BBR congestion control..."
-    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 && ok "BBR enabled." || warn "BBR not available."
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 && ok "BBR enabled." || warn "BBR not available."
 
     step "Tuning network buffers..."
-    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1 || true
-    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1 || true
-    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1 || true
-    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1 || true
+    sysctl -w net.core.somaxconn=65535 >/dev/null 2>&1 || true
+    sysctl -w net.core.netdev_max_backlog=250000 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=134217728 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" >/dev/null 2>&1 || true
 
     step "Tuning TCP timeouts..."
-    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1 || true
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_time=60 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_user_timeout=30000 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_low_latency=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
     cat > /etc/sysctl.d/99-daggerconnect-tunnel.conf << 'EOF'
 net.core.default_qdisc=fq
@@ -221,7 +221,7 @@ EOF
     if ! grep -q "^fs.file-max" /etc/sysctl.d/99-daggerconnect-tunnel.conf 2>/dev/null; then
         echo "fs.file-max=2097152" >> /etc/sysctl.d/99-daggerconnect-tunnel.conf
     fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1 || true
+    sysctl -w fs.file-max=2097152 >/dev/null 2>&1 || true
 
     if ! grep -q "daggerconnect limits" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << 'EOF'
@@ -336,12 +336,12 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now daggerconnect-watchdog.timer >/dev/null 2>&1 || true
-    ok "Watchdog installed — checks every 10s, restarts after ${WATCHDOG_IDLE_THRESHOLD}s idle"
+    ok "Watchdog installed - checks every 10s, restarts after ${WATCHDOG_IDLE_THRESHOLD}s idle"
     info "Log: $WATCHDOG_LOG"
 }
 
 # ============================================================
-# توابع اصلی DaggerConnect
+# Core DaggerConnect Functions
 # ============================================================
 
 download_binary() {
@@ -492,13 +492,13 @@ ask_service_name() {
 ask_transport() {
     echo ""
     echo -e "  ${BOLD}Available Transports:${NC}"
-    echo "    1)  tcp     — Raw TCP tunnel"
-    echo "    2)  ws      — WebSocket tunnel"
-    echo "    3)  wss     — WebSocket Secure (TLS) tunnel"
-    echo "    4)  http    — HTTP Mimicry tunnel"
-    echo "    5)  https   — HTTP Mimicry Secure (TLS) tunnel"
-    echo "    6)  quantum — Raw-packet tunnel (KCP over forged TCP)"
-    echo "    7)  tun     — TUN kernel interface tunnel"
+    echo "    1)  tcp     - Raw TCP tunnel"
+    echo "    2)  ws      - WebSocket tunnel"
+    echo "    3)  wss     - WebSocket Secure (TLS) tunnel"
+    echo "    4)  http    - HTTP Mimicry tunnel"
+    echo "    5)  https   - HTTP Mimicry Secure (TLS) tunnel"
+    echo "    6)  quantum - Raw-packet tunnel (KCP over forged TCP)"
+    echo "    7)  tun     - TUN kernel interface tunnel"
     echo ""
     while true; do
         ask T_CHOICE "Transport" "1"
@@ -572,24 +572,24 @@ build_socks5_yaml() {
 }
 
 # ============================================================
-# توابع SSL
+# SSL Functions
 # ============================================================
 
 install_certbot() {
-    if command -v certbot &>/dev/null; then
+    if command -v certbot >/dev/null 2>&1; then
         ok "certbot already installed."
         return
     fi
     info "Installing certbot..."
-    if command -v apt-get &>/dev/null; then
+    if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq
         apt-get install -y -qq certbot
-    elif command -v yum &>/dev/null; then
+    elif command -v yum >/dev/null 2>&1; then
         yum install -y -q certbot
-    elif command -v dnf &>/dev/null; then
+    elif command -v dnf >/dev/null 2>&1; then
         dnf install -y -q certbot
     else
-        error "Cannot install certbot — package manager not found."
+        error "Cannot install certbot - package manager not found."
     fi
     ok "certbot installed."
 }
@@ -640,8 +640,8 @@ EOF
 ask_ssl_server() {
     echo ""
     echo -e "  ${BOLD}SSL Mode:${NC}"
-    echo "    1)  Automatic SSL  — Let's Encrypt (certbot)"
-    echo "    2)  Custom SSL     — Provide your own cert/key paths"
+    echo "    1)  Automatic SSL  - Let's Encrypt (certbot)"
+    echo "    2)  Custom SSL     - Provide your own cert/key paths"
     echo ""
     while true; do
         ask SSL_CHOICE "SSL Mode" "1"
@@ -681,8 +681,8 @@ ask_ssl_server() {
 ask_ssl_client() {
     echo ""
     echo -e "  ${BOLD}Server Certificate Verification:${NC}"
-    echo "    1)  Verify  — Recommended (server has valid cert)"
-    echo "    2)  Skip    — Skip TLS verification (self-signed)"
+    echo "    1)  Verify  - Recommended (server has valid cert)"
+    echo "    2)  Skip    - Skip TLS verification (self-signed)"
     echo ""
     while true; do
         ask TLS_CHOICE "TLS Verify" "1"
@@ -697,7 +697,7 @@ ask_ssl_client() {
 ask_socks5() {
     echo ""
     echo -e "  ${BOLD}Standalone SOCKS5 Proxy:${NC}"
-    echo -e "        Independent of the transport and port maps above — opens a local"
+    echo -e "        Independent of the transport and port maps above - opens a local"
     echo -e "        SOCKS5 proxy on this server whose traffic is tunneled to the client."
     echo ""
     ask SOCKS5_CHOICE "Enable SOCKS5 proxy? (y/n)" "n"
@@ -711,7 +711,7 @@ ask_socks5() {
 }
 
 # ============================================================
-# توابع نوشتن کانفیگ
+# Config Writer Functions
 # ============================================================
 
 write_server_config_tcp() {
@@ -1608,7 +1608,7 @@ EOF
 }
 
 # ============================================================
-# توابع نصب و مدیریت
+# Installation and Management Functions
 # ============================================================
 
 install_service_hardened() {
@@ -1680,7 +1680,7 @@ ask_watchdog_and_optimizer() {
 }
 
 # ============================================================
-# نصب سرور و کلاینت
+# Server and Client Installation
 # ============================================================
 
 install_server() {
@@ -1722,8 +1722,8 @@ install_server() {
         tun)
             echo ""
             echo -e "  ${BOLD}TUN Encapsulation:${NC}"
-            echo "    1)  tcp   — plain TCP over TUN"
-            echo "    2)  ipx   — raw IP encapsulation"
+            echo "    1)  tcp   - plain TCP over TUN"
+            echo "    2)  ipx   - raw IP encapsulation"
             echo ""
             ask TUN_ENCAP_CHOICE "Encapsulation" "1"
             case "$TUN_ENCAP_CHOICE" in
@@ -1734,10 +1734,10 @@ install_server() {
             if [ "$TUN_ENCAP" = "ipx" ]; then
                 echo ""
                 echo -e "  ${BOLD}IPX Profile:${NC}"
-                echo "    1)  icmp  — ICMP encapsulation"
-                echo "    2)  gre   — GRE (proto 47)"
-                echo "    3)  ipip  — IP-in-IP (proto 4)"
-                echo "    4)  bip   — BIP/ICMP custom"
+                echo "    1)  icmp  - ICMP encapsulation"
+                echo "    2)  gre   - GRE (proto 47)"
+                echo "    3)  ipip  - IP-in-IP (proto 4)"
+                echo "    4)  bip   - BIP/ICMP custom"
                 echo ""
                 ask TUN_PROFILE_CHOICE "Profile" "1"
                 case "$TUN_PROFILE_CHOICE" in
@@ -1902,8 +1902,8 @@ install_client() {
         tun)
             echo ""
             echo -e "  ${BOLD}TUN Encapsulation (must match server):${NC}"
-            echo "    1)  tcp   — plain TCP over TUN"
-            echo "    2)  ipx   — raw IP encapsulation"
+            echo "    1)  tcp   - plain TCP over TUN"
+            echo "    2)  ipx   - raw IP encapsulation"
             echo ""
             ask TUN_ENCAP_CHOICE "Encapsulation" "1"
             case "$TUN_ENCAP_CHOICE" in
@@ -2018,7 +2018,7 @@ EOF
 }
 
 # ============================================================
-# توابع مدیریتی
+# Management Functions
 # ============================================================
 
 show_status() {
@@ -2130,7 +2130,7 @@ service_control() {
             if systemctl is-active --quiet "$svc"; then
                 ok "Running."
             else
-                warn "Failed to start — see logs."
+                warn "Failed to start - see logs."
             fi
             ;;
         2)
@@ -2144,7 +2144,7 @@ service_control() {
             if systemctl is-active --quiet "$svc"; then
                 ok "Running."
             else
-                warn "Failed to start — see logs."
+                warn "Failed to start - see logs."
             fi
             ;;
         4)
@@ -2240,7 +2240,7 @@ show_logs_live() {
     fi
     
     pick_service "Follow logs for" || return 0
-    info "Following ${PICKED_SVC} — press Ctrl+C to return."
+    info "Following ${PICKED_SVC} - press Ctrl+C to return."
     echo ""
     trap ' ' INT
     journalctl -u "$PICKED_SVC" -n 40 -f --no-pager
@@ -2277,7 +2277,7 @@ edit_config() {
         if systemctl is-active --quiet "${svc}"; then
             ok "Running with new config."
         else
-            warn "Service failed to start — config may be invalid."
+            warn "Service failed to start - config may be invalid."
         fi
     fi
 }
@@ -2355,13 +2355,13 @@ uninstall() {
 }
 
 # ============================================================
-# منوی اصلی
+# Main Menu
 # ============================================================
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Installer — Full Edition${NC}"
-    echo -e "  ${DIM}با قابلیت‌های Watchdog، Optimizer، مدیریت پیشرفته${NC}"
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Installer - Full Edition${NC}"
+    echo -e "  ${DIM}Combined DaggerConnect and Backhaul features${NC}"
     echo ""
 }
 
@@ -2405,7 +2405,7 @@ pause() {
 }
 
 # ============================================================
-# شروع برنامه
+# Program Start
 # ============================================================
 
 if [ "$EUID" -ne 0 ]; then
