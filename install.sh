@@ -149,7 +149,7 @@ install_flow() {
         1) TRANSPORT="wss" ;;
         3) TRANSPORT="tcp" ;;
         4) TRANSPORT="tcpmux" ;;
-        *) TRANSPORT="wssmux" ;;
+        5) TRANSPORT="wssmux" ;;
     esac
 
     TOKEN="$FIXED_TOKEN"
