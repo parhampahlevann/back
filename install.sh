@@ -131,29 +131,29 @@ optimize_system() {
     info "Interface: $INTERFACE"
 
     step "Enabling BBR congestion control..."
-    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1 || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 && ok "BBR enabled." || warn "BBR not available."
 
     step "Tuning network buffers..."
-    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1
-    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1
+    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1 || true
+    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1 || true
+    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1 || true
 
     step "Tuning TCP timeouts..."
-    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1 || true
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 || true
 
     cat > /etc/sysctl.d/99-daggerconnect-tunnel.conf << 'EOF'
 net.core.default_qdisc=fq
@@ -202,7 +202,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now daggerconnect-mtu.service >/dev/null 2>&1
+    systemctl enable --now daggerconnect-mtu.service >/dev/null 2>&1 || true
     ok "MTU 1400 applied and persisted"
 
     step "Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8..."
@@ -221,7 +221,7 @@ EOF
     if ! grep -q "^fs.file-max" /etc/sysctl.d/99-daggerconnect-tunnel.conf 2>/dev/null; then
         echo "fs.file-max=2097152" >> /etc/sysctl.d/99-daggerconnect-tunnel.conf
     fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1
+    sysctl -w fs.file-max=2097152 > /dev/null 2>&1 || true
 
     if ! grep -q "daggerconnect limits" /etc/security/limits.conf 2>/dev/null; then
         cat >> /etc/security/limits.conf << 'EOF'
@@ -335,7 +335,7 @@ WantedBy=timers.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now daggerconnect-watchdog.timer >/dev/null 2>&1
+    systemctl enable --now daggerconnect-watchdog.timer >/dev/null 2>&1 || true
     ok "Watchdog installed — checks every 10s, restarts after ${WATCHDOG_IDLE_THRESHOLD}s idle"
     info "Log: $WATCHDOG_LOG"
 }
@@ -723,7 +723,7 @@ write_server_config_tcp() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "tcp",
@@ -749,7 +749,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: tcp
 psk: "${psk}"
@@ -774,7 +774,7 @@ write_client_config_tcp() {
     local server_ip="$1" server_port="$2" psk="$3"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "tcp",
@@ -799,7 +799,7 @@ write_client_config_tcp() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: tcp
 psk: "${psk}"
@@ -830,7 +830,7 @@ write_server_config_ws() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "ws",
@@ -859,7 +859,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: ws
 psk: "${psk}"
@@ -886,7 +886,7 @@ write_client_config_ws() {
     local server_ip="$1" server_port="$2" psk="$3" ws_path="$4"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "ws",
@@ -914,7 +914,7 @@ write_client_config_ws() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: ws
 psk: "${psk}"
@@ -948,7 +948,7 @@ write_server_config_wss() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "wss",
@@ -979,7 +979,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: wss
 psk: "${psk}"
@@ -1008,7 +1008,7 @@ write_client_config_wss() {
     local server_ip="$1" server_port="$2" psk="$3" ws_path="$4" tls_insecure="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "wss",
@@ -1037,7 +1037,7 @@ write_client_config_wss() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: wss
 psk: "${psk}"
@@ -1073,7 +1073,7 @@ write_server_config_http() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "http",
@@ -1103,7 +1103,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: http
 psk: "${psk}"
@@ -1131,7 +1131,7 @@ write_client_config_http() {
     local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "http",
@@ -1160,7 +1160,7 @@ write_client_config_http() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: http
 psk: "${psk}"
@@ -1195,7 +1195,7 @@ write_server_config_https() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "https",
@@ -1227,7 +1227,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: https
 psk: "${psk}"
@@ -1257,7 +1257,7 @@ write_client_config_https() {
     local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5" tls_insecure="$6"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "https",
@@ -1287,7 +1287,7 @@ write_client_config_https() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: https
 psk: "${psk}"
@@ -1324,7 +1324,7 @@ write_server_config_quantum() {
     ports_yaml=$(build_ports_yaml "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "quantum",
@@ -1354,7 +1354,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: quantum
 psk: "${psk}"
@@ -1382,7 +1382,7 @@ write_client_config_quantum() {
     local server_ip="$1" server_port="$2" psk="$3" mtu="$4" block="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "quantum",
@@ -1411,7 +1411,7 @@ write_client_config_quantum() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: quantum
 psk: "${psk}"
@@ -1450,7 +1450,7 @@ write_server_config_tun() {
     mkdir -p "$CONFIG_DIR"
     
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "server",
   "transport": "tun",
@@ -1491,7 +1491,7 @@ $(build_socks5_json)
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: server
 transport: tun
 psk: "${psk}"
@@ -1533,7 +1533,7 @@ write_client_config_tun() {
     mkdir -p "$CONFIG_DIR"
     
     if [ "$CONFIG_FMT" = "json" ]; then
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 {
   "mode": "client",
   "transport": "tun",
@@ -1572,7 +1572,7 @@ write_client_config_tun() {
 }
 EOF
     else
-        cat > "$CONFIG" << EOF
+        cat > "$CONFIG" <<-EOF
 mode: client
 transport: tun
 psk: "${psk}"
@@ -1612,7 +1612,7 @@ EOF
 # ============================================================
 
 install_service_hardened() {
-    cat > "$SERVICE_FILE" << EOF
+    cat > "$SERVICE_FILE" <<-EOF
 [Unit]
 Description=DaggerConnect Tunnel (${SERVICE_NAME})
 After=network.target
@@ -1637,7 +1637,7 @@ SyslogIdentifier=DaggerConnect
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1 || true
     ok "Service installed: ${SERVICE_NAME}"
 }
 
@@ -1826,7 +1826,7 @@ install_server() {
     install_service_hardened
     start_service
 
-    cat > "$STATE_FILE" << EOF
+    cat > "$STATE_FILE" <<-EOF
 MODE=server
 SERVICE_NAME=${SERVICE_NAME}
 TRANSPORT=${TRANSPORT}
@@ -1994,7 +1994,7 @@ install_client() {
     install_service_hardened
     start_service
 
-    cat > "$STATE_FILE" << EOF
+    cat > "$STATE_FILE" <<-EOF
 MODE=client
 SERVICE_NAME=${SERVICE_NAME}
 TRANSPORT=${TRANSPORT}
