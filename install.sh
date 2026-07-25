@@ -1,7 +1,17 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager — v9
+# Backhaul Tunnel Manager — v10
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
+#
+# v10 fix vs v9:
+#   - BUG FIX: after using "Full uninstall (everything)", the install
+#     directory (/root/backhaul-core) was deleted for the rest of that
+#     session. Installing again afterward made curl fail with "No such file
+#     or directory" because it was writing into a directory that no longer
+#     existed. Added an ensure_dirs() guard, now called at the start of
+#     ensure_binary/download_backhaul/install_server/install_client/
+#     setup_watchdog, so the directories are recreated on demand instead of
+#     only once when the script first starts.
 #
 # v9 fixes vs v8:
 #   - BUG FIX: StartLimitIntervalSec/StartLimitBurst were placed under
@@ -142,11 +152,16 @@ gen_port() {
     echo $(( (RANDOM % 40000) + 20000 ))
 }
 
+ensure_dirs() {
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERTS_DIR"
+}
+
 # ============================================================
 # Binary install / smart update
 # ============================================================
 
 download_backhaul() {
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERTS_DIR"
     step "Checking for the latest Backhaul release ..."
     local LATEST_VERSION
     LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -233,6 +248,7 @@ download_backhaul() {
 }
 
 ensure_binary() {
+    ensure_dirs
     if [ -x "$BINARY" ]; then
         return 0
     fi
@@ -699,6 +715,7 @@ pick_service() {
 
 install_server() {
     hr "Install Server"
+    ensure_dirs
     ensure_binary || return
     echo ""
 
@@ -760,6 +777,7 @@ install_server() {
 
 install_client() {
     hr "Install Client"
+    ensure_dirs
     ensure_binary || return
     echo ""
 
@@ -1181,6 +1199,7 @@ EOF
 setup_watchdog() {
     echo ""
     echo "=== Installing Watchdog ==="
+    ensure_dirs
     mkdir -p "$WATCHDOG_STATE_DIR"
 
     cat > "$WATCHDOG_SCRIPT" << WDEOF
@@ -1344,7 +1363,7 @@ uninstall_everything() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v9"
+    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v10"
     echo ""
 }
 
