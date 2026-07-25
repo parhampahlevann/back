@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# Backhaul Tunnel Manager — v15.1 (Fully Fixed & Unified)
+# Backhaul Tunnel Manager — v15.2 (WSS Fixed)
 # 
 # Default ports:
 #   - Server listen port: 8443 (client connects here)
@@ -82,7 +82,7 @@ ask_required() {
 
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║  ❌ ERROR: Please run as root (sudo)                    ║${NC}"
+    echo -e "${RED}║   ❌ ERROR: Please run as root (sudo)                    ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}"
     exit 1
 fi
@@ -177,7 +177,7 @@ ensure_binary() {
 }
 
 # ============================================================
-# SSL Certificate Management
+# SSL Certificate Management (FIXED)
 # ============================================================
 
 generate_self_signed_cert() {
@@ -186,23 +186,25 @@ generate_self_signed_cert() {
     local key_file="${CERTS_DIR}/${name}.key"
     
     if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
-        info "Generating self-signed certificate for ${name}..."
         openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$key_file" -out "$cert_file" \
-            -days 3650 -subj "/CN=backhaul-${name}" 2>/dev/null
+            -days 3650 -subj "/CN=backhaul-${name}" &>/dev/null
         chmod 600 "$key_file"
         chmod 644 "$cert_file"
     fi
     
-    echo "$cert_file|$key_file"
+    RET_CERT_FILE="$cert_file"
+    RET_KEY_FILE="$key_file"
 }
 
 setup_ssl() {
     local service_name="$1"
     local transport="$2"
     
+    RET_CERT_FILE=""
+    RET_KEY_FILE=""
+
     if [[ "$transport" != "wss" && "$transport" != "wssmux" ]]; then
-        echo ""
         return 0
     fi
     
@@ -219,38 +221,36 @@ setup_ssl() {
     case "$choice" in
         1|"self")
             generate_self_signed_cert "$service_name"
-            return 0
             ;;
         2|"letsencrypt")
             local domain
             ask_required domain "Domain name (e.g., tunnel.example.com)"
             
-            if command -v certbot &>/dev/null || apt-get install -y certbot 2>/dev/null || yum install -y certbot 2>/dev/null; then
+            if command -v certbot &>/dev/null || apt-get install -y certbot &>/dev/null || yum install -y certbot &>/dev/null; then
                 if certbot certonly --standalone --non-interactive --agree-tos \
-                    --register-unsafely-without-email -d "$domain" 2>/dev/null; then
-                    echo "/etc/letsencrypt/live/${domain}/fullchain.pem|/etc/letsencrypt/live/${domain}/privkey.pem"
+                    --register-unsafely-without-email -d "$domain" &>/dev/null; then
+                    RET_CERT_FILE="/etc/letsencrypt/live/${domain}/fullchain.pem"
+                    RET_KEY_FILE="/etc/letsencrypt/live/${domain}/privkey.pem"
                     return 0
                 fi
             fi
             error "Let's Encrypt failed. Falling back to self-signed..."
             generate_self_signed_cert "$service_name"
-            return 0
             ;;
         3|"custom")
             local cert_file key_file
             ask cert_file "Certificate file path"
             ask key_file "Private key file path"
             if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
-                echo "$cert_file|$key_file"
+                RET_CERT_FILE="$cert_file"
+                RET_KEY_FILE="$key_file"
                 return 0
             fi
             error "Certificate files not found. Falling back to self-signed..."
             generate_self_signed_cert "$service_name"
-            return 0
             ;;
         *)
             generate_self_signed_cert "$service_name"
-            return 0
             ;;
     esac
 }
@@ -408,12 +408,9 @@ install_server() {
     
     local cert_file="" key_file=""
     if [[ "$transport" =~ ^wss ]]; then
-        local cert_info
-        cert_info=$(setup_ssl "$service_name" "$transport")
-        if [ -n "$cert_info" ]; then
-            cert_file="${cert_info%|*}"
-            key_file="${cert_info#*|}"
-        fi
+        setup_ssl "$service_name" "$transport"
+        cert_file="$RET_CERT_FILE"
+        key_file="$RET_KEY_FILE"
     fi
     
     echo ""
@@ -612,7 +609,7 @@ log_level = "${LOG_LEVEL}"
 EOF
 
     if [[ "$transport" =~ ^wss ]]; then
-        echo "insecure_skip_verify = true" >> "$config_file"
+        echo "noverify = true" >> "$config_file"
     fi
 
     echo -e "\nports = [" >> "$config_file"
@@ -963,13 +960,13 @@ main_menu() {
     while true; do
         clear
         echo -e "${BOLD}${CYAN}"
-        echo "  ____             _     _                   _"
+        echo "  ____             _     _                    _"
         echo " |  _ \  __ _  ___| |   | |  _  _   _  _ | |"
         echo " | |_) |/ _\` |/ __| |/| | | / _\` | / _\` | |"
         echo " |  _ <| (_| | (__|  /| | |  (_| |  (_| | |"
         echo " |_| \_\\__,_|\___|_| |_|_| \__,_| \__,_|_|"
         echo -e "${NC}"
-        echo -e "  ${DIM}Backhaul Tunnel Manager — v15.1${NC}"
+        echo -e "  ${DIM}Backhaul Tunnel Manager — v15.2 (Fixed)${NC}"
         echo -e "  ${DIM}Repo: github.com/${REPO}${NC}"
         echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}\n"
         
@@ -989,15 +986,14 @@ main_menu() {
         echo -e "    ${GREEN}5${NC})  Optimize System ${DIM}(BBR, buffers, limits)${NC}\n"
         echo -e "  ${BOLD}⚙️ Management${NC}"
         echo -e "    ${CYAN}6${NC})  Show service status"
-        echo -e "    ${CYAN}7${NC})  Service control ${DIM}(Start/Stop/Restart/Logs)${NC}"
-        echo -e "    ${CYAN}8${NC})  Edit configuration file"
-        echo -e "    ${RED}9${NC})  Uninstall a single service"
-        echo -e "    ${RED}10${NC}) Uninstall everything\n"
-        echo -e "    ${WHITE}0${NC})  Exit\n"
+        echo -e "    ${CYAN}7${NC})  Service control"
+        echo -e "    ${CYAN}8${NC})  Edit configuration"
+        echo -e "    ${RED}9${NC})  Uninstall single service"
+        echo -e "    ${RED}10${NC}) Uninstall everything"
+        echo -e "    ${RED}0${NC})  Exit\n"
         
         local choice
         ask choice "Select option" "1"
-        
         case "$choice" in
             1) install_server ;;
             2) install_client ;;
@@ -1009,12 +1005,10 @@ main_menu() {
             8) edit_config ;;
             9) uninstall_service ;;
             10) uninstall_all ;;
-            0) echo -e "\n${GREEN}Goodbye!${NC}\n"; exit 0 ;;
-            *) warn "Invalid selection" ;;
+            0) exit 0 ;;
         esac
-        
-        echo ""
-        read -r -p "Press Enter to return to main menu..."
+        echo -e "\nPress Enter to continue..."
+        read -r
     done
 }
 
