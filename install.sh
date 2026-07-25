@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# Backhaul Tunnel Manager — v14 (Fully Fixed & Beautiful)
+# Backhaul Tunnel Manager — v15 (Fully Fixed)
 # 
 # Default ports:
 #   - Server listen port: 8443 (client connects here)
@@ -47,7 +47,10 @@ success() { echo -e "\n${GREEN}${BOLD}✓ $*${NC}"; }
 hr() { echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $*${NC}"; echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; }
 
 ask() {
-    local var="$1" prompt="$2" default="$3"
+    local var="$1" 
+    local prompt="$2" 
+    local default="$3"
+    local input
     if [ -n "$default" ]; then
         echo -ne "${YELLOW}➜${NC} $prompt ${DIM}[${default}]${NC}: "
     else
@@ -61,10 +64,22 @@ ask() {
 confirm() {
     local prompt="$1"
     local default="${2:-n}"
+    local input
     echo -ne "${YELLOW}❓${NC} $prompt ${DIM}[${default}]${NC}: "
     read -r input
     [ -z "$input" ] && input="$default"
     [[ "$input" =~ ^[Yy]$ ]]
+}
+
+ask_required() {
+    local var="$1" 
+    local prompt="$2"
+    while true; do
+        ask "$var" "$prompt" ""
+        eval "local val=\$$var"
+        [ -n "$val" ] && break
+        warn "This field is required."
+    done
 }
 
 if [ "$EUID" -ne 0 ]; then
@@ -181,6 +196,8 @@ generate_self_signed_cert() {
         openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$key_file" -out "$cert_file" \
             -days 3650 -subj "/CN=backhaul-${name}" 2>/dev/null
+        chmod 600 "$key_file"
+        chmod 644 "$cert_file"
     fi
     
     echo "$cert_file|$key_file"
@@ -207,7 +224,8 @@ setup_ssl() {
     
     case "$choice" in
         1|"self")
-            local cert_info=$(generate_self_signed_cert "$service_name")
+            local cert_info
+            cert_info=$(generate_self_signed_cert "$service_name")
             echo "$cert_info"
             return 0
             ;;
@@ -223,12 +241,14 @@ setup_ssl() {
                 fi
             fi
             error "Let's Encrypt failed. Using self-signed..."
-            local cert_info=$(generate_self_signed_cert "$service_name")
+            local cert_info
+            cert_info=$(generate_self_signed_cert "$service_name")
             echo "$cert_info"
             return 0
             ;;
         3|"custom")
-            local cert_file key_file
+            local cert_file
+            local key_file
             ask cert_file "Certificate file path"
             ask key_file "Private key file path"
             if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
@@ -236,26 +256,18 @@ setup_ssl() {
                 return 0
             fi
             error "Certificate files not found. Using self-signed..."
-            local cert_info=$(generate_self_signed_cert "$service_name")
+            local cert_info
+            cert_info=$(generate_self_signed_cert "$service_name")
             echo "$cert_info"
             return 0
             ;;
         *)
-            local cert_info=$(generate_self_signed_cert "$service_name")
+            local cert_info
+            cert_info=$(generate_self_signed_cert "$service_name")
             echo "$cert_info"
             return 0
             ;;
     esac
-}
-
-ask_required() {
-    local var="$1" prompt="$2"
-    while true; do
-        ask "$var" "$prompt" ""
-        eval "local val=\$$var"
-        [ -n "$val" ] && break
-        warn "This field is required."
-    done
 }
 
 # ============================================================
@@ -417,8 +429,9 @@ install_server() {
     local cert_file=""
     local key_file=""
     if [[ "$transport" =~ ^wss ]]; then
+        local cert_info
         cert_info=$(setup_ssl "$service_name" "$transport")
-        if [ -n "$cert_info" ]; then
+        if [ -n "$cert_info" ] && [ "$cert_info" != "" ]; then
             cert_file="${cert_info%|*}"
             key_file="${cert_info#*|}"
         fi
@@ -464,6 +477,7 @@ install_server() {
     
     # Build ports TOML
     local ports_toml=""
+    local i
     for i in "${!ports[@]}"; do
         if [ $i -eq 0 ]; then
             ports_toml="    \"${ports[$i]}\""
@@ -503,6 +517,10 @@ EOF
 
     ok "Config created: ${config_file}"
     
+    # Debug: show config
+    info "Config content:"
+    cat "$config_file"
+    
     # Install systemd service
     local service_file="/etc/systemd/system/${service_name}.service"
     cat > "$service_file" << EOF
@@ -539,6 +557,9 @@ EOF
     else
         warn "⚠️  Service failed to start. Check logs:"
         journalctl -u "${service_name}" -n 20 --no-pager
+        echo ""
+        warn "Trying to run binary directly to see error:"
+        ${BINARY} -c "${config_file}" 2>&1 | head -20
     fi
     
     # Display summary
@@ -631,6 +652,7 @@ install_client() {
     
     # Token (MUST match server)
     echo ""
+    local token
     ask token "Token/PSK (must match server)" "$DEFAULT_TOKEN"
     warn "⚠️  Token must be EXACTLY the same as on server"
     
@@ -827,7 +849,8 @@ EOF
 optimize_system() {
     hr "⚡ System Optimization"
     
-    local iface=$(detect_interface)
+    local iface
+    iface=$(detect_interface)
     info "Interface: ${iface}"
     
     sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
@@ -890,16 +913,19 @@ EOF
 
 list_services() {
     local services=()
+    local cfg
     for cfg in "$CONFIG_DIR"/*.toml; do
         [ -f "$cfg" ] || continue
-        local name=$(basename "$cfg" .toml)
+        local name
+        name=$(basename "$cfg" .toml)
         [ -f "/etc/systemd/system/${name}.service" ] && services+=("$name")
     done
     printf '%s\n' "${services[@]}" | sort -u
 }
 
 pick_service() {
-    local services=($(list_services))
+    local services
+    services=($(list_services))
     if [ ${#services[@]} -eq 0 ]; then
         warn "No services found"
         return 1
@@ -912,8 +938,10 @@ pick_service() {
     
     echo ""
     echo -e "  ${BOLD}📋 Services:${NC}"
+    local i
     for i in "${!services[@]}"; do
-        local status=$(systemctl is-active "${services[$i]}" 2>/dev/null)
+        local status
+        status=$(systemctl is-active "${services[$i]}" 2>/dev/null)
         if [ "$status" = "active" ]; then
             echo -e "    ${GREEN}$((i+1))${NC})  ${services[$i]}  ${GREEN}● running${NC}"
         else
@@ -933,12 +961,14 @@ pick_service() {
 
 show_status() {
     hr "📊 Service Status"
-    local services=($(list_services))
+    local services
+    services=($(list_services))
     if [ ${#services[@]} -eq 0 ]; then
         warn "No services installed"
         return
     fi
     
+    local svc
     for svc in "${services[@]}"; do
         echo ""
         echo -e "${BOLD}${CYAN}━━━ ${svc} ━━━${NC}"
@@ -1054,7 +1084,9 @@ uninstall_all() {
         return
     fi
     
-    local services=($(list_services))
+    local services
+    services=($(list_services))
+    local svc
     for svc in "${services[@]}"; do
         systemctl stop "$svc" 2>/dev/null
         systemctl disable "$svc" 2>/dev/null
@@ -1080,7 +1112,7 @@ show_banner() {
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
-    echo -e "${CYAN}${BOLD}║       🚀  BACKHAUL TUNNEL MANAGER  v14                 ║${NC}"
+    echo -e "${CYAN}${BOLD}║       🚀  BACKHAUL TUNNEL MANAGER  v15                 ║${NC}"
     echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
     echo -e "${CYAN}${BOLD}║       ${WHITE}Secure Reverse Port Forwarding Tool${CYAN}           ║${NC}"
     echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
