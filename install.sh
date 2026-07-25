@@ -1,7 +1,20 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager — v8
+# Backhaul Tunnel Manager — v9
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
+#
+# v9 fixes vs v8:
+#   - BUG FIX: StartLimitIntervalSec/StartLimitBurst were placed under
+#     [Service] in the systemd unit, where systemd doesn't recognize them
+#     (logged as "Unknown key name ... ignoring"). Moved to [Unit], which is
+#     the section systemd actually reads them from.
+#   - Added explicit on-screen reminders during install: the listen port
+#     must be open in the firewall, and transport/token must match exactly
+#     between server and client -- a mismatch there produces exactly the
+#     symptoms reported ("invalid signal received for channel" on the
+#     server, "i/o timeout" on the client): the TCP handshake succeeds, but
+#     the two sides don't agree on how to interpret the control channel, so
+#     Backhaul discards the connection.
 #
 # v8 changes vs v7 (UX/architecture ported over from a DaggerConnect-style installer):
 #   - Named, multi-service model: install as many server/client tunnels on one
@@ -600,6 +613,8 @@ install_service() {
 Description=Backhaul Tunnel (${SERVICE_NAME})
 After=network.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -607,7 +622,6 @@ User=root
 ExecStart=${BINARY} -c ${CONFIG}
 Restart=always
 RestartSec=1
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 TasksMax=infinity
 LimitMEMLOCK=infinity
@@ -697,9 +711,11 @@ install_server() {
     local PORT_DEFAULT
     PORT_DEFAULT=$(gen_port)
     ask PORT "Listen port" "$PORT_DEFAULT"
+    warn "Make sure this port (${PORT}) is open in the firewall (ufw/iptables/cloud security group)."
+    warn "The client connects to THIS port, not to the ports being forwarded below."
     echo ""
 
-    ask TOKEN "Token / PSK  (must match the client)" "$FIXED_TOKEN"
+    ask TOKEN "Token / PSK  (must match the client, exactly — copy/paste it, don't retype)" "$FIXED_TOKEN"
     echo ""
 
     CERT_FILE="" KEY_FILE=""
@@ -751,6 +767,8 @@ install_client() {
     echo ""
 
     ask_transport
+    warn "This MUST be the exact same transport chosen on the server (tcp/tcpmux/ws/wsmux/wss/wssmux)."
+    warn "A mismatch here is the #1 cause of 'invalid signal received for channel' / connection timeouts."
     echo ""
 
     local SERVER_IP SERVER_PORT
@@ -1326,7 +1344,7 @@ uninstall_everything() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v8"
+    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v9"
     echo ""
 }
 
