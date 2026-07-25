@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-# Backhaul Tunnel Manager — v13 (Fixed Port Forwarding)
+# Backhaul Tunnel Manager — v14 (Fully Fixed & Beautiful)
 # 
 # Default ports:
 #   - Server listen port: 8443 (client connects here)
@@ -13,8 +13,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
+PURPLE='\033[0;35m'
+BLUE='\033[0;34m'
+WHITE='\033[1;37m'
 DIM='\033[2m'
 BOLD='\033[1m'
+BLINK='\033[5m'
+REVERSE='\033[7m'
 NC='\033[0m'
 
 REPO="Musixal/Backhaul"
@@ -38,14 +43,15 @@ ok() { echo -e "${DIM}$(_ts)${NC} ${GREEN}[ OK ]${NC}  $*"; }
 warn() { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*"; }
 step() { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; }
+success() { echo -e "\n${GREEN}${BOLD}✓ $*${NC}"; }
 hr() { echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $*${NC}"; echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; }
 
 ask() {
     local var="$1" prompt="$2" default="$3"
     if [ -n "$default" ]; then
-        echo -ne "${YELLOW}?${NC} $prompt [${default}]: "
+        echo -ne "${YELLOW}➜${NC} $prompt ${DIM}[${default}]${NC}: "
     else
-        echo -ne "${YELLOW}?${NC} $prompt: "
+        echo -ne "${YELLOW}➜${NC} $prompt: "
     fi
     read -r input
     [ -z "$input" ] && [ -n "$default" ] && input="$default"
@@ -55,24 +61,16 @@ ask() {
 confirm() {
     local prompt="$1"
     local default="${2:-n}"
-    echo -ne "${YELLOW}?${NC} $prompt (y/n) [${default}]: "
+    echo -ne "${YELLOW}❓${NC} $prompt ${DIM}[${default}]${NC}: "
     read -r input
     [ -z "$input" ] && input="$default"
     [[ "$input" =~ ^[Yy]$ ]]
 }
 
-ask_required() {
-    local var="$1" prompt="$2"
-    while true; do
-        ask "$var" "$prompt" ""
-        eval "local val=\$$var"
-        [ -n "$val" ] && break
-        warn "This field is required."
-    done
-}
-
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[ERR ]${NC}  Please run as root (sudo)."
+    echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  ❌ ERROR: Please run as root (sudo)                    ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}"
     exit 1
 fi
 
@@ -198,10 +196,10 @@ setup_ssl() {
     fi
     
     echo ""
-    echo -e "  ${BOLD}TLS Certificate Options:${NC}"
-    echo "    1)  Self-signed (quick test)"
-    echo "    2)  Let's Encrypt (requires domain)"
-    echo "    3)  Custom certificate"
+    echo -e "  ${BOLD}🔐 TLS Certificate Options:${NC}"
+    echo -e "    ${GREEN}1)${NC}  Self-signed ${DIM}(quick test)${NC}"
+    echo -e "    ${GREEN}2)${NC}  Let's Encrypt ${DIM}(requires domain)${NC}"
+    echo -e "    ${GREEN}3)${NC}  Custom certificate"
     echo ""
     
     local choice
@@ -248,6 +246,16 @@ setup_ssl() {
             return 0
             ;;
     esac
+}
+
+ask_required() {
+    local var="$1" prompt="$2"
+    while true; do
+        ask "$var" "$prompt" ""
+        eval "local val=\$$var"
+        [ -n "$val" ] && break
+        warn "This field is required."
+    done
 }
 
 # ============================================================
@@ -305,13 +313,13 @@ init_profiles() {
 select_profile() {
     init_profiles
     echo ""
-    echo -e "  ${BOLD}Tuning Profile:${NC}"
-    echo "    1)  auto          — Balanced, recommended default"
-    echo "    2)  stable        — Conservative, stable connections"
-    echo "    3)  aggressive    — Maximum throughput"
-    echo "    4)  low_latency   — Minimum delay"
-    echo "    5)  low_hardware  — For weak VPS"
-    echo "    6)  custom        — Manual configuration"
+    echo -e "  ${BOLD}⚡ Tuning Profile:${NC}"
+    echo -e "    ${GREEN}1)${NC}  auto          ${DIM}— Balanced, recommended default${NC}"
+    echo -e "    ${GREEN}2)${NC}  stable        ${DIM}— Conservative, stable connections${NC}"
+    echo -e "    ${GREEN}3)${NC}  aggressive    ${DIM}— Maximum throughput${NC}"
+    echo -e "    ${GREEN}4)${NC}  low_latency   ${DIM}— Minimum delay${NC}"
+    echo -e "    ${GREEN}5)${NC}  low_hardware  ${DIM}— For weak VPS${NC}"
+    echo -e "    ${GREEN}6)${NC}  custom        ${DIM}— Manual configuration${NC}"
     echo ""
     
     local choice
@@ -355,7 +363,7 @@ select_profile() {
 # ============================================================
 
 install_server() {
-    hr "Install Server (Iran Side)"
+    hr "🚀 Install Server (Iran Side)"
     ensure_dirs
     ensure_binary || return 1
     
@@ -371,13 +379,13 @@ install_server() {
     
     # Transport
     echo ""
-    echo -e "  ${BOLD}Transports:${NC}"
-    echo "    1)  tcp"
-    echo "    2)  tcpmux"
-    echo "    3)  ws"
-    echo "    4)  wsmux"
-    echo "    5)  wss     (recommended)"
-    echo "    6)  wssmux  (recommended for many connections)"
+    echo -e "  ${BOLD}🌐 Transports:${NC}"
+    echo -e "    ${GREEN}1)${NC}  tcp"
+    echo -e "    ${GREEN}2)${NC}  tcpmux"
+    echo -e "    ${GREEN}3)${NC}  ws"
+    echo -e "    ${GREEN}4)${NC}  wsmux"
+    echo -e "    ${GREEN}5)${NC}  wss     ${DIM}(recommended)${NC}"
+    echo -e "    ${GREEN}6)${NC}  wssmux  ${DIM}(recommended for many connections)${NC}"
     echo ""
     local transport_choice
     ask transport_choice "Select transport" "5"
@@ -396,7 +404,7 @@ install_server() {
     # Listen port (where client connects)
     local listen_port
     echo ""
-    echo -e "${DIM}This is the port clients connect to.${NC}"
+    echo -e "${DIM}  This is the port clients connect to.${NC}"
     ask listen_port "Server listen port" "8443"
     warn "⚠️  Make sure port ${listen_port} is open in firewall"
     
@@ -418,10 +426,10 @@ install_server() {
     
     # Ports to forward (DEFAULT TUNNEL PORT: 2020)
     echo ""
-    echo -e "${BOLD}Port Forwarding Rules:${NC}"
+    echo -e "${BOLD}🔀 Port Forwarding Rules:${NC}"
     echo -e "  ${DIM}Format: local_port=target_port (e.g., 2020=22)${NC}"
     echo -e "  ${DIM}Or just: local_port (same as target)${NC}"
-    echo -e "  ${DIM}Default tunnel port is 2020 → forwards to 22${NC}"
+    echo -e "  ${DIM}Default tunnel port is ${GREEN}2020${NC}${DIM} → forwards to 22${NC}"
     echo ""
     
     local ports=()
@@ -442,9 +450,9 @@ install_server() {
         if [[ "$p" == *"="* ]]; then
             local local_p="${p%%=*}"
             local target_p="${p##*=}"
-            echo -e "  ${GREEN}→${NC} Port ${local_p} → target ${target_p}"
+            echo -e "  ${GREEN}→${NC} Port ${local_p} ${DIM}→${NC} target ${target_p}"
         else
-            echo -e "  ${GREEN}→${NC} Port ${p} → target ${p}"
+            echo -e "  ${GREEN}→${NC} Port ${p} ${DIM}→${NC} target ${p}"
         fi
     done
     
@@ -527,7 +535,7 @@ EOF
     sleep 2
     
     if systemctl is-active --quiet "${service_name}"; then
-        ok "✅ Service started successfully"
+        success "Service started successfully"
     else
         warn "⚠️  Service failed to start. Check logs:"
         journalctl -u "${service_name}" -n 20 --no-pager
@@ -535,21 +543,23 @@ EOF
     
     # Display summary
     echo ""
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}${BOLD}  Server installed successfully!${NC}"
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║  ✅  SERVER INSTALLED SUCCESSFULLY!                    ║${NC}"
+    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${BOLD}Service:${NC}      ${service_name}"
-    echo -e "  ${BOLD}Transport:${NC}    ${transport}"
-    echo -e "  ${BOLD}Listen Port:${NC}  ${listen_port}  ${DIM}(client connects here)${NC}"
-    echo -e "  ${BOLD}Tunnel Ports:${NC} ${ports[*]}  ${DIM}(forwarded to target)${NC}"
-    echo -e "  ${BOLD}Token:${NC}        ${token}"
-    echo -e "  ${BOLD}Config:${NC}       ${config_file}"
+    echo -e "  ${BOLD}📋 Summary:${NC}"
+    echo -e "    ${CYAN}●${NC} Service:      ${WHITE}${service_name}${NC}"
+    echo -e "    ${CYAN}●${NC} Transport:    ${WHITE}${transport}${NC}"
+    echo -e "    ${CYAN}●${NC} Listen Port:  ${WHITE}${listen_port}${NC}  ${DIM}(client connects here)${NC}"
+    echo -e "    ${CYAN}●${NC} Tunnel Ports: ${WHITE}${ports[*]}${NC}  ${DIM}(forwarded to target)${NC}"
+    echo -e "    ${CYAN}●${NC} Token:        ${WHITE}${token}${NC}"
     echo ""
-    echo -e "  ${DIM}Logs: journalctl -u ${service_name} -f${NC}"
+    echo -e "  ${BOLD}📂 Files:${NC}"
+    echo -e "    ${CYAN}●${NC} Config: ${DIM}${config_file}${NC}"
+    echo -e "    ${CYAN}●${NC} Logs:   ${DIM}journalctl -u ${service_name} -f${NC}"
     echo ""
-    echo -e "  ${YELLOW}💡 Client should connect to: ${BOLD}YOUR_SERVER_IP:${listen_port}${NC}"
-    echo -e "  ${YELLOW}💡 Then access: ${BOLD}YOUR_SERVER_IP:2020${NC} → forwarded to target"
+    echo -e "  ${YELLOW}💡 Client should connect to: ${WHITE}YOUR_SERVER_IP:${listen_port}${NC}"
+    echo -e "  ${YELLOW}💡 Then access: ${WHITE}YOUR_SERVER_IP:2020${NC} ${DIM}→ forwarded to target${NC}"
     echo ""
     
     if confirm "Install watchdog for auto-restart?" "y"; then
@@ -566,7 +576,7 @@ EOF
 # ============================================================
 
 install_client() {
-    hr "Install Client (Kharej Side)"
+    hr "🚀 Install Client (Kharej Side)"
     ensure_dirs
     ensure_binary || return 1
     
@@ -582,13 +592,13 @@ install_client() {
     
     # Transport (MUST match server)
     echo ""
-    echo -e "  ${BOLD}Transport (must match server):${NC}"
-    echo "    1)  tcp"
-    echo "    2)  tcpmux"
-    echo "    3)  ws"
-    echo "    4)  wsmux"
-    echo "    5)  wss"
-    echo "    6)  wssmux"
+    echo -e "  ${BOLD}🌐 Transport (must match server):${NC}"
+    echo -e "    ${GREEN}1)${NC}  tcp"
+    echo -e "    ${GREEN}2)${NC}  tcpmux"
+    echo -e "    ${GREEN}3)${NC}  ws"
+    echo -e "    ${GREEN}4)${NC}  wsmux"
+    echo -e "    ${GREEN}5)${NC}  wss"
+    echo -e "    ${GREEN}6)${NC}  wssmux"
     echo ""
     local transport_choice
     ask transport_choice "Select transport" "5"
@@ -609,7 +619,7 @@ install_client() {
     while true; do
         local server_addr
         echo ""
-        echo -e "${DIM}Server IP and port where the Backhaul server is listening${NC}"
+        echo -e "${DIM}  Server IP and port where the Backhaul server is listening${NC}"
         ask server_addr "Server IP:PORT" "1.2.3.4:8443"
         server_ip="${server_addr%%:*}"
         server_port="${server_addr##*:}"
@@ -693,7 +703,7 @@ EOF
     sleep 2
     
     if systemctl is-active --quiet "${service_name}"; then
-        ok "✅ Service started successfully"
+        success "Service started successfully"
     else
         warn "⚠️  Service failed to start. Check logs:"
         journalctl -u "${service_name}" -n 20 --no-pager
@@ -701,17 +711,19 @@ EOF
     
     # Display summary
     echo ""
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}${BOLD}  Client installed successfully!${NC}"
-    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║  ✅  CLIENT INSTALLED SUCCESSFULLY!                    ║${NC}"
+    echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${BOLD}Service:${NC}     ${service_name}"
-    echo -e "  ${BOLD}Transport:${NC}   ${transport}"
-    echo -e "  ${BOLD}Server:${NC}      ${server_ip}:${server_port}"
-    echo -e "  ${BOLD}Token:${NC}       ${token}"
-    echo -e "  ${BOLD}Config:${NC}      ${config_file}"
+    echo -e "  ${BOLD}📋 Summary:${NC}"
+    echo -e "    ${CYAN}●${NC} Service:   ${WHITE}${service_name}${NC}"
+    echo -e "    ${CYAN}●${NC} Transport: ${WHITE}${transport}${NC}"
+    echo -e "    ${CYAN}●${NC} Server:    ${WHITE}${server_ip}:${server_port}${NC}"
+    echo -e "    ${CYAN}●${NC} Token:     ${WHITE}${token}${NC}"
     echo ""
-    echo -e "  ${DIM}Logs: journalctl -u ${service_name} -f${NC}"
+    echo -e "  ${BOLD}📂 Files:${NC}"
+    echo -e "    ${CYAN}●${NC} Config: ${DIM}${config_file}${NC}"
+    echo -e "    ${CYAN}●${NC} Logs:   ${DIM}journalctl -u ${service_name} -f${NC}"
     echo ""
     
     if confirm "Install watchdog for auto-restart?" "y"; then
@@ -728,7 +740,7 @@ EOF
 # ============================================================
 
 setup_watchdog() {
-    hr "Installing Watchdog"
+    hr "🛡️ Installing Watchdog"
     ensure_dirs
     mkdir -p "$WATCHDOG_STATE_DIR"
     
@@ -813,7 +825,7 @@ EOF
 # ============================================================
 
 optimize_system() {
-    hr "System Optimization"
+    hr "⚡ System Optimization"
     
     local iface=$(detect_interface)
     info "Interface: ${iface}"
@@ -869,7 +881,7 @@ net.ipv4.tcp_fastopen=3
 net.ipv4.ip_forward=1
 EOF
     
-    ok "Optimization complete"
+    success "Optimization complete"
 }
 
 # ============================================================
@@ -899,13 +911,13 @@ pick_service() {
     fi
     
     echo ""
-    echo -e "  ${BOLD}Services:${NC}"
+    echo -e "  ${BOLD}📋 Services:${NC}"
     for i in "${!services[@]}"; do
         local status=$(systemctl is-active "${services[$i]}" 2>/dev/null)
         if [ "$status" = "active" ]; then
-            echo -e "    $((i+1)))  ${services[$i]}  ${GREEN}● running${NC}"
+            echo -e "    ${GREEN}$((i+1))${NC})  ${services[$i]}  ${GREEN}● running${NC}"
         else
-            echo -e "    $((i+1)))  ${services[$i]}  ${RED}○ stopped${NC}"
+            echo -e "    ${RED}$((i+1))${NC})  ${services[$i]}  ${RED}○ stopped${NC}"
         fi
     done
     echo ""
@@ -920,7 +932,7 @@ pick_service() {
 }
 
 show_status() {
-    hr "Service Status"
+    hr "📊 Service Status"
     local services=($(list_services))
     if [ ${#services[@]} -eq 0 ]; then
         warn "No services installed"
@@ -929,29 +941,29 @@ show_status() {
     
     for svc in "${services[@]}"; do
         echo ""
-        echo -e "${BOLD}${svc}${NC}"
+        echo -e "${BOLD}${CYAN}━━━ ${svc} ━━━${NC}"
         systemctl status "$svc" --no-pager --lines=5 2>/dev/null || true
-        echo "---"
+        echo ""
     done
 }
 
 service_control() {
-    hr "Service Control"
+    hr "🎮 Service Control"
     if ! pick_service; then
         return
     fi
     
     local svc="$SELECTED_SERVICE"
     echo ""
-    echo -e "  Selected: ${BOLD}${svc}${NC}"
+    echo -e "  Selected: ${BOLD}${WHITE}${svc}${NC}"
     echo ""
-    echo "  1)  Restart"
-    echo "  2)  Stop"
-    echo "  3)  Start"
-    echo "  4)  Status"
-    echo "  5)  View logs"
-    echo "  6)  Follow logs"
-    echo "  0)  Back"
+    echo -e "    ${GREEN}1${NC})  Restart"
+    echo -e "    ${YELLOW}2${NC})  Stop"
+    echo -e "    ${GREEN}3${NC})  Start"
+    echo -e "    ${BLUE}4${NC})  Status"
+    echo -e "    ${CYAN}5${NC})  View logs"
+    echo -e "    ${CYAN}6${NC})  Follow logs"
+    echo -e "    ${RED}0${NC})  Back"
     echo ""
     
     local action
@@ -969,7 +981,7 @@ service_control() {
 }
 
 edit_config() {
-    hr "Edit Config"
+    hr "✏️ Edit Config"
     if ! pick_service; then
         return
     fi
@@ -1010,7 +1022,7 @@ edit_config() {
 }
 
 remove_service() {
-    hr "Remove Service"
+    hr "🗑️ Remove Service"
     if ! pick_service; then
         return
     fi
@@ -1032,12 +1044,12 @@ remove_service() {
 }
 
 update_binary() {
-    hr "Update Binary"
+    hr "🔄 Update Binary"
     download_backhaul
 }
 
 uninstall_all() {
-    hr "Full Uninstall"
+    hr "💀 Full Uninstall"
     if ! confirm "Remove ALL Backhaul services and files?" "n"; then
         return
     fi
@@ -1056,7 +1068,7 @@ uninstall_all() {
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
     
-    ok "All Backhaul files removed"
+    success "All Backhaul files removed"
 }
 
 # ============================================================
@@ -1067,37 +1079,43 @@ show_banner() {
     clear 2>/dev/null || true
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║           BACKHAUL TUNNEL MANAGER v13                    ║${NC}"
+    echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
+    echo -e "${CYAN}${BOLD}║       🚀  BACKHAUL TUNNEL MANAGER  v14                 ║${NC}"
+    echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
+    echo -e "${CYAN}${BOLD}║       ${WHITE}Secure Reverse Port Forwarding Tool${CYAN}           ║${NC}"
+    echo -e "${CYAN}${BOLD}║                                                          ║${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "  ${DIM}Default tunnel port: 2020 → forwards to 22${NC}"
+    echo -e "  ${DIM}Default tunnel port: ${GREEN}2020${NC}${DIM} → forwards to 22${NC}"
+    echo -e "  ${DIM}Server listen port:  ${GREEN}8443${NC}${DIM}  (client connects here)${NC}"
     echo ""
 }
 
 show_menu() {
-    echo -e "${BOLD}  ─── Installation ───${NC}"
-    echo "    1)  Install Server (Iran side)"
-    echo "    2)  Install Client (Kharej side)"
+    echo -e "${BOLD}  ─── 📦 Installation ───${NC}"
+    echo -e "    ${GREEN}1${NC})  Install Server ${DIM}(Iran side)${NC}"
+    echo -e "    ${GREEN}2${NC})  Install Client ${DIM}(Kharej side)${NC}"
     echo ""
-    echo -e "${BOLD}  ─── Management ───${NC}"
-    echo "    3)  Service Status"
-    echo "    4)  Service Control (start/stop/restart)"
-    echo "    5)  Edit Config"
-    echo "    6)  Remove Service"
+    echo -e "${BOLD}  ─── ⚙️  Management ───${NC}"
+    echo -e "    ${BLUE}3${NC})  Service Status"
+    echo -e "    ${BLUE}4${NC})  Service Control ${DIM}(start/stop/restart)${NC}"
+    echo -e "    ${BLUE}5${NC})  Edit Config"
+    echo -e "    ${BLUE}6${NC})  Remove Service"
     echo ""
-    echo -e "${BOLD}  ─── System ───${NC}"
-    echo "    7)  System Optimizer"
-    echo "    8)  Watchdog (auto-restart)"
-    echo "    9)  Update Binary"
-    echo "   10)  Full Uninstall"
+    echo -e "${BOLD}  ─── 🛠️  System ───${NC}"
+    echo -e "    ${MAGENTA}7${NC})  System Optimizer ${DIM}(BBR, buffers, MTU)${NC}"
+    echo -e "    ${MAGENTA}8${NC})  Watchdog ${DIM}(auto-restart)${NC}"
+    echo -e "    ${MAGENTA}9${NC})  Update Binary"
+    echo -e "    ${RED}10${NC})  Full Uninstall"
     echo ""
-    echo "    0)  Exit"
+    echo -e "${BOLD}  ─── 🚪 Exit ───${NC}"
+    echo -e "    ${RED}0${NC})  Exit"
     echo ""
 }
 
 pause_menu() {
     echo ""
-    echo -ne "${YELLOW}Press Enter to continue...${NC}"
+    echo -ne "${DIM}Press Enter to continue...${NC}"
     read -r _
 }
 
@@ -1123,8 +1141,17 @@ while true; do
         8) setup_watchdog ;;
         9) update_binary ;;
         10) uninstall_all ;;
-        0) echo -e "\n  ${CYAN}Goodbye!${NC}\n"; exit 0 ;;
-        *) warn "Invalid option: $choice" ;;
+        0) 
+            echo ""
+            echo -e "  ${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+            echo -e "  ${GREEN}${BOLD}║  👋  Goodbye!  Thanks for using Backhaul Tunnel Manager  ║${NC}"
+            echo -e "  ${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            exit 0 
+            ;;
+        *) 
+            warn "Invalid option: $choice" 
+            ;;
     esac
     
     pause_menu
