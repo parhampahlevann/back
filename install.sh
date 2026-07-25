@@ -1,62 +1,12 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager — v10
-# Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
-#
-# v10 fix vs v9:
-#   - BUG FIX: after using "Full uninstall (everything)", the install
-#     directory (/root/backhaul-core) was deleted for the rest of that
-#     session. Installing again afterward made curl fail with "No such file
-#     or directory" because it was writing into a directory that no longer
-#     existed. Added an ensure_dirs() guard, now called at the start of
-#     ensure_binary/download_backhaul/install_server/install_client/
-#     setup_watchdog, so the directories are recreated on demand instead of
-#     only once when the script first starts.
-#
-# v9 fixes vs v8:
-#   - BUG FIX: StartLimitIntervalSec/StartLimitBurst were placed under
-#     [Service] in the systemd unit, where systemd doesn't recognize them
-#     (logged as "Unknown key name ... ignoring"). Moved to [Unit], which is
-#     the section systemd actually reads them from.
-#   - Added explicit on-screen reminders during install: the listen port
-#     must be open in the firewall, and transport/token must match exactly
-#     between server and client -- a mismatch there produces exactly the
-#     symptoms reported ("invalid signal received for channel" on the
-#     server, "i/o timeout" on the client): the TCP handshake succeeds, but
-#     the two sides don't agree on how to interpret the control channel, so
-#     Backhaul discards the connection.
-#
-# v8 changes vs v7 (UX/architecture ported over from a DaggerConnect-style installer):
-#   - Named, multi-service model: install as many server/client tunnels on one
-#     box as you like, each with its own label, config, and systemd unit
-#     (instead of one fixed "iranPORT"/"kharejPORT" naming scheme).
-#   - Colored, timestamped logging (info/ok/warn/step/error) + a service
-#     picker used everywhere (status/control/edit/logs/remove).
-#   - Smart binary installer/updater: checks the latest GitHub tag, compares
-#     against the installed version, backs up before replacing, rolls back on
-#     a broken download, and offers to restart running tunnels after an update.
-#   - TLS for wss/wssmux now has 3 modes: self-signed (quick test), automatic
-#     Let's Encrypt via certbot (with an auto-renew restart hook), or custom
-#     cert/key paths -- each service gets its own cert.
-#   - Advanced tuning profiles (auto/stable/aggressive/low_latency/
-#     low_hardware/custom) mapped onto Backhaul's real tunable fields
-#     (keepalive_period, heartbeat, channel_size, mux_con, connection_pool,
-#     aggressive_pool, retry_interval, log_level).
-#   - Config editor with automatic backup + revert-on-failed-restart.
-#   - Live log following and last-N-lines log viewing, per service.
-#   - Everything from v7 kept: system optimizer (BBR/buffers/MTU/DNS/ulimits)
-#     and the idle-connection watchdog, both updated for the new multi-service
-#     layout.
-#
-# NOT ported from the other installer, and why: that script targets a
-# different binary (DaggerConnect) with its own config schema. Its quantum /
-# tun / http-https-mimicry transports and SOCKS5 proxy option are features of
-# THAT binary, not of Backhaul -- Backhaul's real transports are only
-# tcp / tcpmux / ws / wsmux / wss / wssmux, and its TOML schema has no SOCKS5
-# block. Inventing those fields here would just produce a config Backhaul
-# can't parse, so they're intentionally left out.
-#
-# Run this SEPARATELY on each server (Iran and Kharej). No SSH auto-sync.
+# ============================================================
+# Backhaul Tunnel Manager — v13 (Fixed Port Forwarding)
+# 
+# Default ports:
+#   - Server listen port: 8443 (client connects here)
+#   - Tunnel port: 2020 (forwards to target, e.g., 2020=22)
+# ============================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -76,28 +26,19 @@ WATCHDOG_SCRIPT="${INSTALL_DIR}/watchdog.sh"
 WATCHDOG_LOG="${INSTALL_DIR}/watchdog.log"
 WATCHDOG_STATE_DIR="${INSTALL_DIR}/watchdog-state"
 WATCHDOG_IDLE_THRESHOLD=30
-FIXED_TOKEN="123"
-
-SERVICE_NAME=""
-SERVICE_FILE=""
-CONFIG=""
-TRANSPORT=""
-SSL_MODE=""
-DOMAIN=""
-CERT_FILE=""
-KEY_FILE=""
+DEFAULT_TOKEN="Backhaul2024Secure"
 
 # ============================================================
-# Logging helpers
+# Logging Helpers
 # ============================================================
 
-_ts()   { date '+%H:%M:%S'; }
-info()  { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
-ok()    { echo -e "${DIM}$(_ts)${NC} ${GREEN}[ OK ]${NC}  $*"; }
-warn()  { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*"; }
-step()  { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
+_ts() { date '+%H:%M:%S'; }
+info() { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
+ok() { echo -e "${DIM}$(_ts)${NC} ${GREEN}[ OK ]${NC}  $*"; }
+warn() { echo -e "${DIM}$(_ts)${NC} ${YELLOW}[WARN]${NC}  $*"; }
+step() { echo -e "${DIM}$(_ts)${NC} ${MAGENTA}[STEP]${NC}  $*"; }
 error() { echo -e "${DIM}$(_ts)${NC} ${RED}[ERR ]${NC}  $*"; }
-hr()    { echo -e "\n${BOLD}${CYAN}== $* ==${NC}"; }
+hr() { echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $*${NC}"; echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"; }
 
 ask() {
     local var="$1" prompt="$2" default="$3"
@@ -111,18 +52,23 @@ ask() {
     eval "$var=\"\$input\""
 }
 
+confirm() {
+    local prompt="$1"
+    local default="${2:-n}"
+    echo -ne "${YELLOW}?${NC} $prompt (y/n) [${default}]: "
+    read -r input
+    [ -z "$input" ] && input="$default"
+    [[ "$input" =~ ^[Yy]$ ]]
+}
+
 ask_required() {
     local var="$1" prompt="$2"
     while true; do
         ask "$var" "$prompt" ""
         eval "local val=\$$var"
         [ -n "$val" ] && break
-        warn "This field cannot be empty."
+        warn "This field is required."
     done
-}
-
-validate_label() {
-    echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
 if [ "$EUID" -ne 0 ]; then
@@ -133,23 +79,15 @@ fi
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERTS_DIR"
 
 # ============================================================
-# Basic helpers
+# Core Functions
 # ============================================================
 
-detect_public_ip() {
-    curl -fsSL -4 https://ifconfig.me 2>/dev/null || curl -fsSL -4 https://api.ipify.org 2>/dev/null || echo ""
+detect_interface() {
+    ip -o -4 route show to default | awk '{print $5}' | head -n1 || echo "eth0"
 }
 
-detect_default_iface() {
-    local iface
-    iface=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-    [ -z "$iface" ] && iface=$(ip link show | grep "state UP" | head -1 | awk '{print $2}' | cut -d: -f1)
-    [ -z "$iface" ] && iface="eth0"
-    echo "$iface"
-}
-
-gen_port() {
-    echo $(( (RANDOM % 40000) + 20000 ))
+generate_port() {
+    echo $(( (RANDOM % 30000) + 20000 ))
 }
 
 ensure_dirs() {
@@ -157,476 +95,411 @@ ensure_dirs() {
 }
 
 # ============================================================
-# Binary install / smart update
+# Binary Management
 # ============================================================
 
 download_backhaul() {
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERTS_DIR"
-    step "Checking for the latest Backhaul release ..."
+    ensure_dirs
+    step "Checking latest Backhaul release..."
+    
     local LATEST_VERSION
     LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-
+    
     if [ -z "$LATEST_VERSION" ]; then
-        warn "Could not reach GitHub to check the latest version."
-        if [ -x "$BINARY" ]; then
-            ok "Using existing local binary: ${BINARY}"
-            return 0
-        fi
-        error "No local binary and GitHub is unreachable. Cannot continue."
+        warn "Cannot reach GitHub. Using existing binary if available."
+        [ -x "$BINARY" ] && return 0
+        error "No binary available. Please check internet connection."
         return 1
     fi
-    info "Latest release: ${LATEST_VERSION}"
-
+    
+    info "Latest version: ${LATEST_VERSION}"
+    
     local CURRENT_VERSION=""
-    if [ -x "$BINARY" ]; then
-        CURRENT_VERSION=$("$BINARY" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
-    fi
+    [ -x "$BINARY" ] && CURRENT_VERSION=$("$BINARY" -v 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    
     if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
-        ok "Already on the latest version (${CURRENT_VERSION})."
+        ok "Already latest version (${CURRENT_VERSION})"
         return 0
     fi
-
-    local arch asset_arch url
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64) asset_arch="amd64" ;;
-        aarch64) asset_arch="arm64" ;;
-        *) error "Unsupported architecture: $arch"; return 1 ;;
+    
+    local arch
+    case $(uname -m) in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        *) error "Unsupported architecture: $(uname -m)"; return 1 ;;
     esac
-    url=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep "browser_download_url" | grep "linux_${asset_arch}" | grep -v ".sha256" \
-        | head -n1 | cut -d '"' -f4)
-    if [ -z "$url" ]; then
-        warn "Could not auto-resolve a release asset URL."
-        ask url "Paste the correct .tar.gz download URL" ""
-    fi
-
-    [ -x "$BINARY" ] && cp "$BINARY" "${BINARY}.backup"
-
-    if [ -n "$CURRENT_VERSION" ]; then
-        step "Updating Backhaul: ${CURRENT_VERSION} -> ${LATEST_VERSION} ..."
-    else
-        step "Downloading Backhaul ${LATEST_VERSION} ..."
-    fi
-
-    rm -f "${INSTALL_DIR}/backhaul.tar.gz"
-    local attempt=0
-    until curl -fSL --retry 3 --retry-delay 2 -o "${INSTALL_DIR}/backhaul.tar.gz" "$url"; do
-        attempt=$((attempt + 1))
-        if [ "$attempt" -ge 3 ]; then
-            warn "Download failed after multiple attempts."
-            [ -f "${BINARY}.backup" ] && mv -f "${BINARY}.backup" "$BINARY" && warn "Keeping previous binary."
-            return 1
-        fi
-        echo "Retrying download..."
-        sleep 2
-    done
-
-    if [ ! -s "${INSTALL_DIR}/backhaul.tar.gz" ] || ! tar -tzf "${INSTALL_DIR}/backhaul.tar.gz" >/dev/null 2>&1; then
-        warn "Downloaded archive is empty or invalid."
-        rm -f "${INSTALL_DIR}/backhaul.tar.gz"
-        [ -f "${BINARY}.backup" ] && mv -f "${BINARY}.backup" "$BINARY" && warn "Keeping previous binary."
+    
+    local URL
+    URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | \
+          grep "browser_download_url" | grep "linux_${arch}" | grep -v ".sha256" | \
+          head -n1 | cut -d '"' -f4)
+    
+    if [ -z "$URL" ]; then
+        error "Could not find download URL"
         return 1
     fi
-
-    tar -xzf "${INSTALL_DIR}/backhaul.tar.gz" -C "$INSTALL_DIR"
-    rm -f "${INSTALL_DIR}/backhaul.tar.gz" "${BINARY}.backup"
-    chmod +x "$BINARY"
-    ok "Backhaul is up to date (${LATEST_VERSION})."
-
-    mapfile -t SERVICES < <(list_services)
-    if [ ${#SERVICES[@]} -gt 0 ]; then
-        echo ""
-        warn "Running tunnels are still using the old binary in memory until restarted."
-        ask RESTART_CHOICE "Restart all Backhaul services now? (y/n)" "y"
-        if [ "$RESTART_CHOICE" = "y" ] || [ "$RESTART_CHOICE" = "Y" ]; then
-            for svc in "${SERVICES[@]}"; do
-                systemctl restart "$svc" && ok "Restarted: ${svc}" || warn "Failed to restart: ${svc}"
-            done
+    
+    [ -x "$BINARY" ] && cp "$BINARY" "${BINARY}.backup"
+    
+    step "Downloading Backhaul ${LATEST_VERSION}..."
+    if curl -fSL --retry 3 --retry-delay 2 -o "${INSTALL_DIR}/backhaul.tar.gz" "$URL"; then
+        if tar -xzf "${INSTALL_DIR}/backhaul.tar.gz" -C "$INSTALL_DIR" 2>/dev/null; then
+            rm -f "${INSTALL_DIR}/backhaul.tar.gz" "${BINARY}.backup"
+            chmod +x "$BINARY"
+            ok "Binary updated to ${LATEST_VERSION}"
+            return 0
         fi
     fi
+    
+    warn "Download/installation failed"
+    [ -f "${BINARY}.backup" ] && mv -f "${BINARY}.backup" "$BINARY"
+    return 1
 }
 
 ensure_binary() {
-    ensure_dirs
     if [ -x "$BINARY" ]; then
         return 0
     fi
-    echo ""
-    warn "No Backhaul binary found at ${BINARY}."
-    ask DOWNLOAD_CHOICE "Download the latest release now? (y/n)" "y"
-    if [ "$DOWNLOAD_CHOICE" != "y" ] && [ "$DOWNLOAD_CHOICE" != "Y" ]; then
-        error "Cannot continue without a binary."
-        return 1
+    
+    warn "Backhaul binary not found."
+    if confirm "Download latest release now?" "y"; then
+        download_backhaul
+        return $?
     fi
-    download_backhaul
+    return 1
 }
 
 # ============================================================
-# TLS certificates (self-signed / Let's Encrypt / custom)
+# SSL Certificate Management
 # ============================================================
 
-install_certbot() {
-    if command -v certbot &>/dev/null; then
-        ok "certbot already installed."
-        return
+generate_self_signed_cert() {
+    local name="$1"
+    local cert_file="${CERTS_DIR}/${name}.crt"
+    local key_file="${CERTS_DIR}/${name}.key"
+    
+    if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
+        info "Generating self-signed certificate for ${name}..."
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$key_file" -out "$cert_file" \
+            -days 3650 -subj "/CN=backhaul-${name}" 2>/dev/null
     fi
-    info "Installing certbot..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update -qq
-        apt-get install -y -qq certbot
-    elif command -v yum &>/dev/null; then
-        yum install -y -q certbot
-    elif command -v dnf &>/dev/null; then
-        dnf install -y -q certbot
-    else
-        error "Cannot install certbot — package manager not found. Install it manually."
-        return 1
-    fi
-    ok "certbot installed."
+    
+    echo "$cert_file|$key_file"
 }
 
-obtain_cert_auto() {
-    local domain="$1"
-    local cert_dir="/etc/letsencrypt/live/${domain}"
-
-    install_certbot || return 1
-
-    if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-        warn "Port 80 is in use. Standalone certbot will likely fail unless it's freed."
+setup_ssl() {
+    local service_name="$1"
+    local transport="$2"
+    
+    if [[ "$transport" != "wss" && "$transport" != "wssmux" ]]; then
+        echo ""
+        return 0
     fi
-
-    info "Obtaining SSL certificate for: ${domain}"
-    if certbot certonly \
-        --standalone \
-        --non-interactive \
-        --agree-tos \
-        --register-unsafely-without-email \
-        -d "$domain" \
-        --http-01-port 80 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
-        ok "Certificate obtained successfully."
-    else
-        error "certbot failed. Make sure port 80 is open and the domain points to this server."
-        return 1
-    fi
-
-    CERT_FILE="${cert_dir}/fullchain.pem"
-    KEY_FILE="${cert_dir}/privkey.pem"
-
-    if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
-        error "Certificate files not found at ${cert_dir}"
-        return 1
-    fi
-
-    ok "Cert : ${CERT_FILE}"
-    ok "Key  : ${KEY_FILE}"
-
-    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
-    mkdir -p "$hook_dir"
-    cat > "${hook_dir}/backhaul-${SERVICE_NAME}.sh" << EOF
-#!/bin/bash
-systemctl restart ${SERVICE_NAME} 2>/dev/null || true
-EOF
-    chmod +x "${hook_dir}/backhaul-${SERVICE_NAME}.sh"
-    ok "Auto-renew hook installed."
-}
-
-ask_ssl_server() {
+    
     echo ""
-    echo -e "  ${BOLD}TLS Certificate:${NC}"
-    echo "    1)  Self-signed   — quick, works immediately (fine for testing)"
-    echo "    2)  Automatic SSL — Let's Encrypt via certbot (needs a real domain + port 80)"
-    echo "    3)  Custom SSL    — provide your own cert/key paths"
+    echo -e "  ${BOLD}TLS Certificate Options:${NC}"
+    echo "    1)  Self-signed (quick test)"
+    echo "    2)  Let's Encrypt (requires domain)"
+    echo "    3)  Custom certificate"
     echo ""
-    while true; do
-        ask SSL_CHOICE "TLS Mode" "1"
-        case "$SSL_CHOICE" in
-            1|self|selfsigned) SSL_MODE="self";   break ;;
-            2|auto)             SSL_MODE="auto";   break ;;
-            3|custom)           SSL_MODE="custom"; break ;;
-            *) warn "Please enter 1, 2 or 3." ;;
-        esac
-    done
-
-    case "$SSL_MODE" in
-        self)
-            CERT_FILE="${CERTS_DIR}/${SERVICE_NAME}.crt"
-            KEY_FILE="${CERTS_DIR}/${SERVICE_NAME}.key"
-            if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
-                info "Generating self-signed certificate..."
-                openssl req -x509 -newkey rsa:2048 -nodes \
-                    -keyout "$KEY_FILE" -out "$CERT_FILE" \
-                    -days 3650 -subj "/CN=backhaul" >/dev/null 2>&1
+    
+    local choice
+    ask choice "Select option" "1"
+    
+    case "$choice" in
+        1|"self")
+            local cert_info=$(generate_self_signed_cert "$service_name")
+            echo "$cert_info"
+            return 0
+            ;;
+        2|"letsencrypt")
+            local domain
+            ask_required domain "Domain name (e.g., tunnel.example.com)"
+            
+            if command -v certbot &>/dev/null || apt-get install -y certbot 2>/dev/null || yum install -y certbot 2>/dev/null; then
+                if certbot certonly --standalone --non-interactive --agree-tos \
+                    --register-unsafely-without-email -d "$domain" 2>/dev/null; then
+                    echo "/etc/letsencrypt/live/${domain}/fullchain.pem|/etc/letsencrypt/live/${domain}/privkey.pem"
+                    return 0
+                fi
             fi
-            ok "Cert : ${CERT_FILE}"
-            ok "Key  : ${KEY_FILE}"
-            warn "Self-signed certs may be rejected by strict TLS clients. If the client"
-            warn "side fails to connect, switch to Automatic or Custom SSL instead."
+            error "Let's Encrypt failed. Using self-signed..."
+            local cert_info=$(generate_self_signed_cert "$service_name")
+            echo "$cert_info"
+            return 0
             ;;
-        auto)
-            echo ""
-            ask_required DOMAIN "Domain name  (e.g. tunnel.example.com)"
-            echo ""
-            obtain_cert_auto "$DOMAIN"
+        3|"custom")
+            local cert_file key_file
+            ask cert_file "Certificate file path"
+            ask key_file "Private key file path"
+            if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+                echo "$cert_file|$key_file"
+                return 0
+            fi
+            error "Certificate files not found. Using self-signed..."
+            local cert_info=$(generate_self_signed_cert "$service_name")
+            echo "$cert_info"
+            return 0
             ;;
-        custom)
-            echo ""
-            while true; do
-                ask_required CERT_FILE "Certificate file path  (e.g. /etc/ssl/certs/cert.pem)"
-                [ -f "$CERT_FILE" ] && break
-                warn "File not found: ${CERT_FILE}"
-            done
-            while true; do
-                ask_required KEY_FILE "Private key file path  (e.g. /etc/ssl/private/key.pem)"
-                [ -f "$KEY_FILE" ] && break
-                warn "File not found: ${KEY_FILE}"
-            done
-            ok "Cert : ${CERT_FILE}"
-            ok "Key  : ${KEY_FILE}"
+        *)
+            local cert_info=$(generate_self_signed_cert "$service_name")
+            echo "$cert_info"
+            return 0
             ;;
     esac
 }
 
 # ============================================================
-# Service naming / transport selection
+# Configuration Generation
 # ============================================================
 
-ask_service_name() {
-    while true; do
-        ask LABEL "Service Name    (e.g. iran1, client-home, relay01)" ""
-        if [ -z "$LABEL" ]; then
-            warn "Service Name cannot be empty."
-            continue
-        fi
-        if ! validate_label "$LABEL"; then
-            warn "Only letters, numbers, - and _ are allowed."
-            continue
-        fi
-
-        local svc_file="/etc/systemd/system/${LABEL}.service"
-        local cfg_file="${CONFIG_DIR}/${LABEL}.toml"
-
-        if [ -f "$svc_file" ] || [ -f "$cfg_file" ]; then
-            echo ""
-            warn "Already exists: ${LABEL}"
-            ask OVERWRITE "Overwrite? (y/n)" "n"
-            if [ "$OVERWRITE" = "y" ] || [ "$OVERWRITE" = "Y" ]; then
-                break
-            fi
-            info "Enter a different service name."
-            echo ""
-            continue
-        fi
-        break
-    done
-
-    SERVICE_NAME="${LABEL}"
-    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-    CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.toml"
-
-    echo ""
-    info "Service Name : ${SERVICE_NAME}"
-    info "Config File  : ${CONFIG}"
+declare -A PROFILE_VALUES
+init_profiles() {
+    PROFILE_VALUES["auto_keepalive"]=20
+    PROFILE_VALUES["auto_heartbeat"]=15
+    PROFILE_VALUES["auto_channel_size"]=16384
+    PROFILE_VALUES["auto_mux_con"]=8
+    PROFILE_VALUES["auto_conn_pool"]=8
+    PROFILE_VALUES["auto_aggressive"]=true
+    PROFILE_VALUES["auto_retry"]=1
+    PROFILE_VALUES["auto_log_level"]="warn"
+    
+    PROFILE_VALUES["stable_keepalive"]=30
+    PROFILE_VALUES["stable_heartbeat"]=20
+    PROFILE_VALUES["stable_channel_size"]=4096
+    PROFILE_VALUES["stable_mux_con"]=8
+    PROFILE_VALUES["stable_conn_pool"]=8
+    PROFILE_VALUES["stable_aggressive"]=false
+    PROFILE_VALUES["stable_retry"]=3
+    PROFILE_VALUES["stable_log_level"]="info"
+    
+    PROFILE_VALUES["aggressive_keepalive"]=10
+    PROFILE_VALUES["aggressive_heartbeat"]=8
+    PROFILE_VALUES["aggressive_channel_size"]=32768
+    PROFILE_VALUES["aggressive_mux_con"]=16
+    PROFILE_VALUES["aggressive_conn_pool"]=16
+    PROFILE_VALUES["aggressive_aggressive"]=true
+    PROFILE_VALUES["aggressive_retry"]=1
+    PROFILE_VALUES["aggressive_log_level"]="warn"
+    
+    PROFILE_VALUES["low_latency_keepalive"]=10
+    PROFILE_VALUES["low_latency_heartbeat"]=5
+    PROFILE_VALUES["low_latency_channel_size"]=2048
+    PROFILE_VALUES["low_latency_mux_con"]=4
+    PROFILE_VALUES["low_latency_conn_pool"]=4
+    PROFILE_VALUES["low_latency_aggressive"]=false
+    PROFILE_VALUES["low_latency_retry"]=1
+    PROFILE_VALUES["low_latency_log_level"]="info"
+    
+    PROFILE_VALUES["low_hardware_keepalive"]=60
+    PROFILE_VALUES["low_hardware_heartbeat"]=30
+    PROFILE_VALUES["low_hardware_channel_size"]=1024
+    PROFILE_VALUES["low_hardware_mux_con"]=2
+    PROFILE_VALUES["low_hardware_conn_pool"]=2
+    PROFILE_VALUES["low_hardware_aggressive"]=false
+    PROFILE_VALUES["low_hardware_retry"]=5
+    PROFILE_VALUES["low_hardware_log_level"]="info"
 }
 
-ask_transport() {
+select_profile() {
+    init_profiles
     echo ""
-    echo -e "  ${BOLD}Available Transports:${NC}"
-    echo "    1)  tcp     — Raw TCP tunnel"
-    echo "    2)  tcpmux  — TCP + multiplexing (many concurrent connections)"
-    echo "    3)  ws      — WebSocket tunnel"
-    echo "    4)  wsmux   — WebSocket + multiplexing"
-    echo "    5)  wss     — WebSocket Secure (TLS), looks like HTTPS (recommended)"
-    echo "    6)  wssmux  — WebSocket Secure + multiplexing"
+    echo -e "  ${BOLD}Tuning Profile:${NC}"
+    echo "    1)  auto          — Balanced, recommended default"
+    echo "    2)  stable        — Conservative, stable connections"
+    echo "    3)  aggressive    — Maximum throughput"
+    echo "    4)  low_latency   — Minimum delay"
+    echo "    5)  low_hardware  — For weak VPS"
+    echo "    6)  custom        — Manual configuration"
     echo ""
-    while true; do
-        ask T_CHOICE "Transport" "5"
-        case "$T_CHOICE" in
-            1|tcp)    TRANSPORT="tcp";    break ;;
-            2|tcpmux) TRANSPORT="tcpmux"; break ;;
-            3|ws)     TRANSPORT="ws";     break ;;
-            4|wsmux)  TRANSPORT="wsmux";  break ;;
-            5|wss)    TRANSPORT="wss";    break ;;
-            6|wssmux) TRANSPORT="wssmux"; break ;;
-            *) warn "Please enter 1-6 or a transport name." ;;
-        esac
-    done
-    info "Transport : ${TRANSPORT}"
+    
+    local choice
+    ask choice "Select profile" "1"
+    
+    local profile="auto"
+    case "$choice" in
+        2|stable) profile="stable" ;;
+        3|aggressive) profile="aggressive" ;;
+        4|low_latency) profile="low_latency" ;;
+        5|low_hardware) profile="low_hardware" ;;
+        6|custom) profile="custom" ;;
+        *) profile="auto" ;;
+    esac
+    
+    if [ "$profile" = "custom" ]; then
+        ask KEEPALIVE "keepalive_period (sec)" "20"
+        ask HEARTBEAT "heartbeat (sec)" "15"
+        ask CHANNEL_SIZE "channel_size" "16384"
+        ask MUX_CON "mux_con" "8"
+        ask CONN_POOL "connection_pool (client)" "8"
+        ask AGGRESSIVE "aggressive_pool (true/false)" "true"
+        ask RETRY_INTERVAL "retry_interval (client, sec)" "1"
+        ask LOG_LEVEL "log_level (info/warn/error)" "warn"
+    else
+        KEEPALIVE="${PROFILE_VALUES["${profile}_keepalive"]}"
+        HEARTBEAT="${PROFILE_VALUES["${profile}_heartbeat"]}"
+        CHANNEL_SIZE="${PROFILE_VALUES["${profile}_channel_size"]}"
+        MUX_CON="${PROFILE_VALUES["${profile}_mux_con"]}"
+        CONN_POOL="${PROFILE_VALUES["${profile}_conn_pool"]}"
+        AGGRESSIVE="${PROFILE_VALUES["${profile}_aggressive"]}"
+        RETRY_INTERVAL="${PROFILE_VALUES["${profile}_retry"]}"
+        LOG_LEVEL="${PROFILE_VALUES["${profile}_log_level"]}"
+    fi
+    
+    ok "Profile: ${profile} applied"
 }
 
 # ============================================================
-# Ports
+# Install Server
 # ============================================================
 
-ask_ports() {
-    echo ""
-    echo -e "  Ports to forward. One per line, or comma-separated. Empty line when done."
-    echo -e "        Example : 22                   (bind :22 -> target :22)"
-    echo -e "        Example : 2222=22              (bind :2222 -> target :22)"
-    echo -e "        Example : 800,3005,4155,6550   (multiple at once)"
-    PORTS=()
+install_server() {
+    hr "Install Server (Iran Side)"
+    ensure_dirs
+    ensure_binary || return 1
+    
+    # Service name
+    local service_name
     while true; do
-        ask P "Port" ""
-        [ -z "$P" ] && break
-        IFS="," read -ra _parts <<< "$P"
+        ask service_name "Service name (e.g., iran1, server-main)" "iran1"
+        if [ -n "$service_name" ] && [[ "$service_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            break
+        fi
+        warn "Use only letters, numbers, - and _"
+    done
+    
+    # Transport
+    echo ""
+    echo -e "  ${BOLD}Transports:${NC}"
+    echo "    1)  tcp"
+    echo "    2)  tcpmux"
+    echo "    3)  ws"
+    echo "    4)  wsmux"
+    echo "    5)  wss     (recommended)"
+    echo "    6)  wssmux  (recommended for many connections)"
+    echo ""
+    local transport_choice
+    ask transport_choice "Select transport" "5"
+    
+    local transport
+    case "$transport_choice" in
+        1|tcp) transport="tcp" ;;
+        2|tcpmux) transport="tcpmux" ;;
+        3|ws) transport="ws" ;;
+        4|wsmux) transport="wsmux" ;;
+        5|wss) transport="wss" ;;
+        6|wssmux) transport="wssmux" ;;
+        *) transport="wss" ;;
+    esac
+    
+    # Listen port (where client connects)
+    local listen_port
+    echo ""
+    echo -e "${DIM}This is the port clients connect to.${NC}"
+    ask listen_port "Server listen port" "8443"
+    warn "⚠️  Make sure port ${listen_port} is open in firewall"
+    
+    # Token
+    local token
+    echo ""
+    ask token "Token/PSK (must match client)" "$DEFAULT_TOKEN"
+    
+    # SSL for WSS
+    local cert_file=""
+    local key_file=""
+    if [[ "$transport" =~ ^wss ]]; then
+        cert_info=$(setup_ssl "$service_name" "$transport")
+        if [ -n "$cert_info" ]; then
+            cert_file="${cert_info%|*}"
+            key_file="${cert_info#*|}"
+        fi
+    fi
+    
+    # Ports to forward (DEFAULT TUNNEL PORT: 2020)
+    echo ""
+    echo -e "${BOLD}Port Forwarding Rules:${NC}"
+    echo -e "  ${DIM}Format: local_port=target_port (e.g., 2020=22)${NC}"
+    echo -e "  ${DIM}Or just: local_port (same as target)${NC}"
+    echo -e "  ${DIM}Default tunnel port is 2020 → forwards to 22${NC}"
+    echo ""
+    
+    local ports=()
+    local port_input
+    ask port_input "Port to forward" "2020=22"
+    if [ -n "$port_input" ]; then
+        IFS=',' read -ra _parts <<< "$port_input"
         for _p in "${_parts[@]}"; do
             _p="${_p// /}"
-            [ -n "$_p" ] && PORTS+=("$_p")
+            [ -n "$_p" ] && ports+=("$_p")
         done
-    done
-    if [ ${#PORTS[@]} -eq 0 ]; then
-        warn "No ports defined. Adding default 2222=22."
-        PORTS=("2222=22")
     fi
-}
-
-build_ports_toml() {
-    local first=1
-    for p in "$@"; do
-        if [ "$first" = "1" ]; then
-            printf '    "%s"' "$p"
-            first=0
+    [ ${#ports[@]} -eq 0 ] && ports=("2020=22")
+    
+    # Show what will be forwarded
+    echo ""
+    for p in "${ports[@]}"; do
+        if [[ "$p" == *"="* ]]; then
+            local local_p="${p%%=*}"
+            local target_p="${p##*=}"
+            echo -e "  ${GREEN}→${NC} Port ${local_p} → target ${target_p}"
         else
-            printf ',\n    "%s"' "$p"
+            echo -e "  ${GREEN}→${NC} Port ${p} → target ${p}"
         fi
     done
-    echo ""
-}
-
-# ============================================================
-# Advanced tuning profiles
-# ============================================================
-
-ADV_PROFILE="auto"
-ADV_KEEPALIVE="20"
-ADV_HEARTBEAT="15"
-ADV_CHANNEL_SIZE="16384"
-ADV_MUX_CON="8"
-ADV_CONN_POOL="8"
-ADV_AGGRESSIVE_POOL="true"
-ADV_RETRY_INTERVAL="1"
-ADV_LOG_LEVEL="warn"
-
-apply_profile() {
-    local p="$1"
-    ADV_PROFILE="$p"
-    case "$p" in
-        auto)
-            ADV_KEEPALIVE=20  ADV_HEARTBEAT=15 ADV_CHANNEL_SIZE=16384 ADV_MUX_CON=8
-            ADV_CONN_POOL=8   ADV_AGGRESSIVE_POOL=true  ADV_RETRY_INTERVAL=1 ADV_LOG_LEVEL="warn"
-            ;;
-        stable)
-            ADV_KEEPALIVE=30  ADV_HEARTBEAT=20 ADV_CHANNEL_SIZE=4096  ADV_MUX_CON=8
-            ADV_CONN_POOL=8   ADV_AGGRESSIVE_POOL=false ADV_RETRY_INTERVAL=3 ADV_LOG_LEVEL="info"
-            ;;
-        aggressive)
-            ADV_KEEPALIVE=10  ADV_HEARTBEAT=8  ADV_CHANNEL_SIZE=32768 ADV_MUX_CON=16
-            ADV_CONN_POOL=16  ADV_AGGRESSIVE_POOL=true  ADV_RETRY_INTERVAL=1 ADV_LOG_LEVEL="warn"
-            ;;
-        low_latency)
-            ADV_KEEPALIVE=10  ADV_HEARTBEAT=5  ADV_CHANNEL_SIZE=2048  ADV_MUX_CON=4
-            ADV_CONN_POOL=4   ADV_AGGRESSIVE_POOL=false ADV_RETRY_INTERVAL=1 ADV_LOG_LEVEL="info"
-            ;;
-        low_hardware)
-            ADV_KEEPALIVE=60  ADV_HEARTBEAT=30 ADV_CHANNEL_SIZE=1024  ADV_MUX_CON=2
-            ADV_CONN_POOL=2   ADV_AGGRESSIVE_POOL=false ADV_RETRY_INTERVAL=5 ADV_LOG_LEVEL="info"
-            ;;
-    esac
-}
-
-ask_advanced() {
-    echo ""
-    echo -e "  ${BOLD}Tuner Profile:${NC}"
-    echo "    1)  auto         — Recommended low-latency defaults"
-    echo "    2)  stable       — Balanced, conservative for most setups"
-    echo "    3)  aggressive   — Max throughput, higher memory usage"
-    echo "    4)  low_latency  — Minimum delay, small buffers"
-    echo "    5)  low_hardware — Weak VPS / low RAM"
-    echo "    6)  custom       — Set every value manually"
-    echo ""
-    ask ADV_CHOICE "Tuner Profile" "1"
-    echo ""
-    case "$ADV_CHOICE" in
-        1|auto)         apply_profile "auto" ;;
-        2|stable)       apply_profile "stable" ;;
-        3|aggressive)   apply_profile "aggressive" ;;
-        4|low_latency)  apply_profile "low_latency" ;;
-        5|low_hardware) apply_profile "low_hardware" ;;
-        6|custom)
-            ADV_PROFILE="custom"
-            ask ADV_KEEPALIVE       "keepalive_period    (sec)"   "20"
-            ask ADV_HEARTBEAT       "heartbeat           (sec)"   "15"
-            ask ADV_CHANNEL_SIZE    "channel_size        (count)" "16384"
-            ask ADV_MUX_CON         "mux_con             (count)" "8"
-            ask ADV_CONN_POOL       "connection_pool     (client only)" "8"
-            ask ADV_AGGRESSIVE_POOL "aggressive_pool     (true/false, client only)" "true"
-            ask ADV_RETRY_INTERVAL  "retry_interval      (sec, client only)" "1"
-            ask ADV_LOG_LEVEL       "log_level           (info/warn/error)" "warn"
-            ;;
-        *) apply_profile "auto" ;;
-    esac
-    info "Tuner Profile : ${ADV_PROFILE}"
-}
-
-# ============================================================
-# Config writers
-# ============================================================
-
-write_server_config() {
-    local cfg="$1" port="$2" token="$3" transport="$4" cert="$5" key="$6"
-    shift 6
-    local ports_toml
-    ports_toml=$(build_ports_toml "$@")
-    {
-        echo "[server]"
-        echo "bind_addr = \"0.0.0.0:${port}\""
-        echo "transport = \"${transport}\""
-        echo "token = \"${token}\""
-        echo "keepalive_period = ${ADV_KEEPALIVE}"
-        echo "nodelay = true"
-        echo "channel_size = ${ADV_CHANNEL_SIZE}"
-        echo "heartbeat = ${ADV_HEARTBEAT}"
-        echo "mux_con = ${ADV_MUX_CON}"
-        if [ "$transport" = "wss" ] || [ "$transport" = "wssmux" ]; then
-            echo "tls_cert = \"${cert}\""
-            echo "tls_key = \"${key}\""
+    
+    # Tuning profile
+    select_profile
+    
+    # Build config
+    local config_file="${CONFIG_DIR}/${service_name}.toml"
+    
+    # Build ports TOML
+    local ports_toml=""
+    for i in "${!ports[@]}"; do
+        if [ $i -eq 0 ]; then
+            ports_toml="    \"${ports[$i]}\""
+        else
+            ports_toml="${ports_toml},\n    \"${ports[$i]}\""
         fi
-        echo "sniffer = false"
-        echo "web_port = 0"
-        echo "log_level = \"${ADV_LOG_LEVEL}\""
-        echo ""
-        echo "ports = ["
-        echo "$ports_toml"
-        echo "]"
-    } > "$cfg"
-}
+    done
+    
+    cat > "$config_file" << EOF
+[server]
+bind_addr = "0.0.0.0:${listen_port}"
+transport = "${transport}"
+token = "${token}"
+keepalive_period = ${KEEPALIVE}
+nodelay = true
+channel_size = ${CHANNEL_SIZE}
+heartbeat = ${HEARTBEAT}
+mux_con = ${MUX_CON}
+sniffer = false
+web_port = 0
+log_level = "${LOG_LEVEL}"
+EOF
 
-write_client_config() {
-    local cfg="$1" server_ip="$2" server_port="$3" token="$4" transport="$5"
-    {
-        echo "[client]"
-        echo "remote_addr = \"${server_ip}:${server_port}\""
-        echo "transport = \"${transport}\""
-        echo "token = \"${token}\""
-        echo "connection_pool = ${ADV_CONN_POOL}"
-        echo "aggressive_pool = ${ADV_AGGRESSIVE_POOL}"
-        echo "keepalive_period = ${ADV_KEEPALIVE}"
-        echo "nodelay = true"
-        echo "retry_interval = ${ADV_RETRY_INTERVAL}"
-        echo "sniffer = false"
-        echo "web_port = 0"
-        echo "log_level = \"${ADV_LOG_LEVEL}\""
-    } > "$cfg"
-}
+    if [[ "$transport" =~ ^wss ]] && [ -n "$cert_file" ] && [ -n "$key_file" ]; then
+        cat >> "$config_file" << EOF
+tls_cert = "${cert_file}"
+tls_key = "${key_file}"
+EOF
+    fi
 
-# ============================================================
-# systemd service management
-# ============================================================
+    cat >> "$config_file" << EOF
 
-install_service() {
-    cat > "$SERVICE_FILE" << EOF
+ports = [
+${ports_toml}
+]
+EOF
+
+    ok "Config created: ${config_file}"
+    
+    # Install systemd service
+    local service_file="/etc/systemd/system/${service_name}.service"
+    cat > "$service_file" << EOF
 [Unit]
-Description=Backhaul Tunnel (${SERVICE_NAME})
+Description=Backhaul Server (${service_name})
 After=network.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -635,527 +508,349 @@ StartLimitBurst=0
 [Service]
 Type=simple
 User=root
-ExecStart=${BINARY} -c ${CONFIG}
+ExecStart=${BINARY} -c ${config_file}
 Restart=always
 RestartSec=1
 LimitNOFILE=1048576
 TasksMax=infinity
-LimitMEMLOCK=infinity
 OOMScoreAdjust=-1000
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=backhaul-${SERVICE_NAME}
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}.service" > /dev/null 2>&1
-    ok "Service installed: ${SERVICE_NAME}"
-}
-
-start_service() {
-    systemctl restart "${SERVICE_NAME}.service"
+    systemctl enable "${service_name}" 2>/dev/null
+    systemctl restart "${service_name}"
     sleep 2
-    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
-        ok "Service is running."
+    
+    if systemctl is-active --quiet "${service_name}"; then
+        ok "✅ Service started successfully"
     else
-        warn "Service failed to start. Logs:"
-        journalctl -u "${SERVICE_NAME}.service" -n 20 --no-pager
+        warn "⚠️  Service failed to start. Check logs:"
+        journalctl -u "${service_name}" -n 20 --no-pager
     fi
-}
-
-list_services() {
-    local found=()
-    for cfg in "${CONFIG_DIR}"/*.toml; do
-        [ -f "$cfg" ] || continue
-        local name
-        name=$(basename "$cfg" .toml)
-        [ -f "/etc/systemd/system/${name}.service" ] && found+=("${name}.service")
-    done
-    [ ${#found[@]} -eq 0 ] && return 0
-    printf '%s\n' "${found[@]}" | sort -u
-}
-
-PICKED_SVC=""
-pick_service() {
-    PICKED_SVC=""
-    local prompt="${1:-Select service}"
-    mapfile -t SERVICES < <(list_services)
-
-    if [ ${#SERVICES[@]} -eq 0 ]; then
-        warn "No Backhaul services found."
-        return 1
-    fi
-
-    if [ ${#SERVICES[@]} -eq 1 ]; then
-        PICKED_SVC="${SERVICES[0]}"
-        return 0
-    fi
-
-    echo -e "  ${BOLD}Available services:${NC}"
-    for i in "${!SERVICES[@]}"; do
-        local st
-        systemctl is-active --quiet "${SERVICES[$i]}" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
-        echo -e "    $((i+1)))  ${SERVICES[$i]}   [${st}]"
-    done
+    
+    # Display summary
     echo ""
-    ask IDX "$prompt (number)" "1"
-    if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVICES[@]} ]; then
-        warn "Invalid selection."
-        return 1
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  Server installed successfully!${NC}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${BOLD}Service:${NC}      ${service_name}"
+    echo -e "  ${BOLD}Transport:${NC}    ${transport}"
+    echo -e "  ${BOLD}Listen Port:${NC}  ${listen_port}  ${DIM}(client connects here)${NC}"
+    echo -e "  ${BOLD}Tunnel Ports:${NC} ${ports[*]}  ${DIM}(forwarded to target)${NC}"
+    echo -e "  ${BOLD}Token:${NC}        ${token}"
+    echo -e "  ${BOLD}Config:${NC}       ${config_file}"
+    echo ""
+    echo -e "  ${DIM}Logs: journalctl -u ${service_name} -f${NC}"
+    echo ""
+    echo -e "  ${YELLOW}💡 Client should connect to: ${BOLD}YOUR_SERVER_IP:${listen_port}${NC}"
+    echo -e "  ${YELLOW}💡 Then access: ${BOLD}YOUR_SERVER_IP:2020${NC} → forwarded to target"
+    echo ""
+    
+    if confirm "Install watchdog for auto-restart?" "y"; then
+        setup_watchdog
     fi
-    PICKED_SVC="${SERVICES[$((IDX-1))]}"
-    return 0
+    
+    if confirm "Run system optimizer (BBR, buffers, etc.)?" "n"; then
+        optimize_system
+    fi
 }
 
 # ============================================================
-# Install flows
+# Install Client
 # ============================================================
-
-install_server() {
-    hr "Install Server"
-    ensure_dirs
-    ensure_binary || return
-    echo ""
-
-    ask_service_name
-    echo ""
-
-    ask_transport
-    echo ""
-
-    local PORT_DEFAULT
-    PORT_DEFAULT=$(gen_port)
-    ask PORT "Listen port" "$PORT_DEFAULT"
-    warn "Make sure this port (${PORT}) is open in the firewall (ufw/iptables/cloud security group)."
-    warn "The client connects to THIS port, not to the ports being forwarded below."
-    echo ""
-
-    ask TOKEN "Token / PSK  (must match the client, exactly — copy/paste it, don't retype)" "$FIXED_TOKEN"
-    echo ""
-
-    CERT_FILE="" KEY_FILE=""
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        ask_ssl_server
-        echo ""
-    fi
-
-    ask_ports
-    echo ""
-
-    ask_advanced
-    echo ""
-
-    write_server_config "$CONFIG" "$PORT" "$TOKEN" "$TRANSPORT" "$CERT_FILE" "$KEY_FILE" "${PORTS[@]}"
-    ok "Config written: ${CONFIG}"
-
-    install_service
-    start_service
-
-    echo ""
-    echo -e "${GREEN}${BOLD}  Server installed successfully.${NC}"
-    echo ""
-    echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
-    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
-    echo -e "  Port      : ${BOLD}${PORT}${NC}"
-    echo -e "  Token     : ${BOLD}${TOKEN}${NC}"
-    [ -n "$CERT_FILE" ] && echo -e "  Cert      : ${BOLD}${CERT_FILE}${NC}"
-    echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
-    echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
-    if [ "$TOKEN" = "$FIXED_TOKEN" ]; then
-        echo -e "  ${DIM}(Reminder: token is the default '${FIXED_TOKEN}' — fine for testing, weak for production.)${NC}"
-    fi
-    echo ""
-
-    ask RUNOPT "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n)" "n"
-    [ "$RUNOPT" = "y" ] || [ "$RUNOPT" = "Y" ] && optimize_system
-
-    ask RUNWD "Install/refresh the watchdog (auto-restart on dead/idle tunnel)? (y/n)" "y"
-    [ "$RUNWD" = "y" ] || [ "$RUNWD" = "Y" ] && setup_watchdog
-}
 
 install_client() {
-    hr "Install Client"
+    hr "Install Client (Kharej Side)"
     ensure_dirs
-    ensure_binary || return
-    echo ""
-
-    ask_service_name
-    echo ""
-
-    ask_transport
-    warn "This MUST be the exact same transport chosen on the server (tcp/tcpmux/ws/wsmux/wss/wssmux)."
-    warn "A mismatch here is the #1 cause of 'invalid signal received for channel' / connection timeouts."
-    echo ""
-
-    local SERVER_IP SERVER_PORT
+    ensure_binary || return 1
+    
+    # Service name
+    local service_name
     while true; do
-        echo -e "        Example : 1.1.1.1:8443"
-        ask SERVER_ADDR "Server IP And Port" ""
-        SERVER_IP="${SERVER_ADDR%%:*}"
-        SERVER_PORT="${SERVER_ADDR##*:}"
-        if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
-            warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
-        else
+        ask service_name "Service name (e.g., kharej1, client-home)" "kharej1"
+        if [ -n "$service_name" ] && [[ "$service_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
             break
         fi
+        warn "Use only letters, numbers, - and _"
     done
+    
+    # Transport (MUST match server)
     echo ""
-
-    ask TOKEN "Token / PSK  (must match the server)" "$FIXED_TOKEN"
+    echo -e "  ${BOLD}Transport (must match server):${NC}"
+    echo "    1)  tcp"
+    echo "    2)  tcpmux"
+    echo "    3)  ws"
+    echo "    4)  wsmux"
+    echo "    5)  wss"
+    echo "    6)  wssmux"
     echo ""
-
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        warn "This client connects over TLS. If the server uses a self-signed"
-        warn "certificate, the handshake may be rejected — use Automatic or"
-        warn "Custom SSL on the server side if the client fails to connect."
-        echo ""
-    fi
-
-    ask_advanced
-    echo ""
-
-    write_client_config "$CONFIG" "$SERVER_IP" "$SERVER_PORT" "$TOKEN" "$TRANSPORT"
-    ok "Config written: ${CONFIG}"
-
-    install_service
-    start_service
-
-    echo ""
-    echo -e "${GREEN}${BOLD}  Client installed successfully.${NC}"
-    echo ""
-    echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
-    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
-    echo -e "  Server    : ${BOLD}${SERVER_IP}:${SERVER_PORT}${NC}"
-    echo -e "  Token     : ${BOLD}${TOKEN}${NC}"
-    echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
-    echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
-    echo ""
-
-    ask RUNOPT "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n)" "n"
-    [ "$RUNOPT" = "y" ] || [ "$RUNOPT" = "Y" ] && optimize_system
-
-    ask RUNWD "Install/refresh the watchdog (auto-restart on dead/idle tunnel)? (y/n)" "y"
-    [ "$RUNWD" = "y" ] || [ "$RUNWD" = "Y" ] && setup_watchdog
-}
-
-# ============================================================
-# Status / logs / control / edit
-# ============================================================
-
-show_status() {
-    hr "Service Status"
-    echo ""
-    mapfile -t SERVICES < <(list_services)
-    if [ ${#SERVICES[@]} -eq 0 ]; then
-        warn "No Backhaul services found."
-        return
-    fi
-    for svc in "${SERVICES[@]}"; do
-        echo -e "${BOLD}${svc}${NC}"
-        systemctl status "$svc" --no-pager --lines=5 2>/dev/null || true
-        echo ""
-    done
-
-    echo "=== Recent warnings (token mismatch / connection issues) ==="
-    local found_warning=0
-    for svc in "${SERVICES[@]}"; do
-        local warntxt
-        warntxt=$(journalctl -u "$svc" -n 20 --no-pager 2>/dev/null | grep -iE "invalid security token|error|failed" | tail -n 3)
-        if [ -n "$warntxt" ]; then
-            found_warning=1
-            echo "--- $svc ---"
-            echo "$warntxt"
-        fi
-    done
-    [ "$found_warning" = "0" ] && echo "None found in the last 20 log lines of each service."
-
-    if [ -f "$WATCHDOG_LOG" ]; then
-        echo ""
-        echo "=== Last 10 watchdog restarts ==="
-        tail -n 10 "$WATCHDOG_LOG"
-    fi
-}
-
-show_logs() {
-    hr "Logs"
-    echo ""
-    pick_service "View logs for" || return 0
-    journalctl -u "$PICKED_SVC" -n 80 --no-pager
-}
-
-show_logs_live() {
-    hr "Live Logs"
-    echo ""
-    pick_service "Follow logs for" || return 0
-    info "Following ${PICKED_SVC} — press Ctrl+C to return to the menu."
-    echo ""
-    trap ' ' INT
-    journalctl -u "$PICKED_SVC" -n 40 -f --no-pager
-    trap - INT
-    echo ""
-    ok "Stopped following logs."
-}
-
-service_control() {
-    hr "Service Control"
-    echo ""
-    pick_service "Manage" || return 0
-    local svc="$PICKED_SVC"
-
-    echo ""
-    local st
-    systemctl is-active --quiet "$svc" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
-    echo -e "  Selected : ${BOLD}${svc}${NC}   [${st}]"
-    echo ""
-    echo "  1)  Restart"
-    echo "  2)  Stop"
-    echo "  3)  Start"
-    echo "  4)  Status"
-    echo "  5)  Enable auto-start"
-    echo "  6)  Disable auto-start"
-    echo "  0)  Back"
-    echo ""
-    ask ACT "Action" "1"
-
-    case "$ACT" in
-        1) step "Restarting ${svc} ..."; systemctl restart "$svc"; sleep 2
-           systemctl is-active --quiet "$svc" && ok "Running." || warn "Failed to start — see logs." ;;
-        2) step "Stopping ${svc} ..."; systemctl stop "$svc" && ok "Stopped." || warn "Could not stop." ;;
-        3) step "Starting ${svc} ..."; systemctl start "$svc"; sleep 2
-           systemctl is-active --quiet "$svc" && ok "Running." || warn "Failed to start — see logs." ;;
-        4) systemctl status "$svc" --no-pager --lines=10 2>/dev/null || true ;;
-        5) systemctl enable "$svc" && ok "Enabled." ;;
-        6) systemctl disable "$svc" && ok "Disabled." ;;
-        0|"") return 0 ;;
-        *) warn "Invalid action." ;;
+    local transport_choice
+    ask transport_choice "Select transport" "5"
+    
+    local transport
+    case "$transport_choice" in
+        1|tcp) transport="tcp" ;;
+        2|tcpmux) transport="tcpmux" ;;
+        3|ws) transport="ws" ;;
+        4|wsmux) transport="wsmux" ;;
+        5|wss) transport="wss" ;;
+        6|wssmux) transport="wssmux" ;;
+        *) transport="wss" ;;
     esac
-}
-
-edit_config() {
-    hr "Edit Config"
-    echo ""
-    pick_service "Edit config for" || return 0
-    local label="${PICKED_SVC%.service}"
-    local cfg="${CONFIG_DIR}/${label}.toml"
-    if [ ! -f "$cfg" ]; then
-        warn "No config file found for ${label}."
-        return 0
-    fi
-
-    local ed="${EDITOR:-}"
-    if [ -z "$ed" ]; then
-        for cand in nano vim vi; do
-            command -v "$cand" >/dev/null 2>&1 && { ed="$cand"; break; }
-        done
-    fi
-    if [ -z "$ed" ]; then
-        warn "No editor found (nano/vim/vi). Install one: apt install nano"
-        return 0
-    fi
-
-    cp "$cfg" "${cfg}.bak" 2>/dev/null && info "Backup saved: ${cfg}.bak"
-    info "Opening ${cfg} in ${ed} ..."
-    "$ed" "$cfg"
-
-    echo ""
-    ask DORESTART "Restart the service to apply changes? (y/n)" "y"
-    if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
-        step "Restarting ${label} ..."
-        systemctl restart "${label}"
-        sleep 2
-        if systemctl is-active --quiet "${label}"; then
-            ok "Running with new config."
-        else
-            warn "Service failed to start — config may be invalid."
-            ask REVERT "Restore backup and restart? (y/n)" "y"
-            if [ "$REVERT" = "y" ] || [ "$REVERT" = "Y" ]; then
-                cp "${cfg}.bak" "$cfg" && systemctl restart "${label}" && ok "Reverted to previous config."
-            fi
+    
+    # Server address
+    local server_ip server_port
+    while true; do
+        local server_addr
+        echo ""
+        echo -e "${DIM}Server IP and port where the Backhaul server is listening${NC}"
+        ask server_addr "Server IP:PORT" "1.2.3.4:8443"
+        server_ip="${server_addr%%:*}"
+        server_port="${server_addr##*:}"
+        if [ -n "$server_ip" ] && [ -n "$server_port" ] && [ "$server_ip" != "$server_port" ]; then
+            break
         fi
-    fi
-}
-
-# ============================================================
-# Manage inbound ports (server-role services)
-# ============================================================
-
-manage_ports() {
-    hr "Manage Inbound Ports"
-    echo ""
-    mapfile -t ALL < <(list_services)
-    local SERVER_SVCS=()
-    for s in "${ALL[@]}"; do
-        local cfg="${CONFIG_DIR}/${s%.service}.toml"
-        grep -q '^\[server\]' "$cfg" 2>/dev/null && SERVER_SVCS+=("$s")
+        warn "Invalid format. Use IP:PORT (e.g., 1.2.3.4:8443)"
     done
-    if [ ${#SERVER_SVCS[@]} -eq 0 ]; then
-        warn "No server-role services on this machine."
-        return
-    fi
-
-    echo "Server-role services:"
-    for i in "${!SERVER_SVCS[@]}"; do echo "  $((i+1)))  ${SERVER_SVCS[$i]}"; done
-    ask IDX "Select number" "1"
-    if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVER_SVCS[@]} ]; then
-        warn "Invalid selection."
-        return
-    fi
-    local SVC="${SERVER_SVCS[$((IDX-1))]}"
-    local cfg="${CONFIG_DIR}/${SVC%.service}.toml"
-
+    
+    # Token (MUST match server)
     echo ""
-    echo "Current ports:"
-    sed -n '/ports = \[/,/\]/p' "$cfg"
-    echo ""
-    echo "1) Add a port"
-    echo "2) Remove a port"
-    ask PCHOICE "Choice" "1"
+    ask token "Token/PSK (must match server)" "$DEFAULT_TOKEN"
+    warn "⚠️  Token must be EXACTLY the same as on server"
+    
+    # Tuning profile
+    select_profile
+    
+    # Build config
+    local config_file="${CONFIG_DIR}/${service_name}.toml"
+    
+    cat > "$config_file" << EOF
+[client]
+remote_addr = "${server_ip}:${server_port}"
+transport = "${transport}"
+token = "${token}"
+connection_pool = ${CONN_POOL}
+EOF
 
-    mapfile -t CURPORTS < <(sed -n '/ports = \[/,/\]/p' "$cfg" | grep -oE '"[^"]+"' | tr -d '"')
-
-    if [ "$PCHOICE" = "1" ]; then
-        ask NEWPORT "Port to add  (e.g. 2050 or 2222=22)" ""
-        [ -n "$NEWPORT" ] && CURPORTS+=("$NEWPORT")
+    if [[ "$AGGRESSIVE" == "true" ]]; then
+        echo "aggressive_pool = true" >> "$config_file"
     else
-        ask OLDPORT "Port to remove" ""
-        local tmp=()
-        for p in "${CURPORTS[@]}"; do [ "$p" != "$OLDPORT" ] && tmp+=("$p"); done
-        CURPORTS=("${tmp[@]}")
+        echo "aggressive_pool = false" >> "$config_file"
     fi
 
-    local ports_toml
-    ports_toml=$(build_ports_toml "${CURPORTS[@]}")
+    cat >> "$config_file" << EOF
+keepalive_period = ${KEEPALIVE}
+channel_size = ${CHANNEL_SIZE}
+mux_con = ${MUX_CON}
+heartbeat = ${HEARTBEAT}
+retry_interval = ${RETRY_INTERVAL}
+sniffer = false
+web_port = 0
+log_level = "${LOG_LEVEL}"
+EOF
 
-    python3 - "$cfg" "$ports_toml" << 'PYEOF' 2>/dev/null || true
-import sys, re
-path, ports_block = sys.argv[1], sys.argv[2]
-with open(path) as f:
-    content = f.read()
-content = re.sub(r'ports = \[.*?\]', 'ports = [\n' + ports_block + '\n]', content, flags=re.S)
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
+    if [[ "$transport" =~ ^wss ]]; then
+        echo "insecure_skip_verify = true" >> "$config_file"
+    fi
 
-    ok "Ports updated."
-    systemctl restart "$SVC"
-    ok "Restarted ${SVC}."
-}
-
-# ============================================================
-# MTU / DNS / ulimits / system optimizer  (from v7)
-# ============================================================
-
-ensure_mtu() {
-    echo ""
-    echo "=== Setting MTU to 1400 ==="
-    local iface
-    iface=$(detect_default_iface)
-    echo "Interface: $iface"
-
-    ip link set dev "$iface" mtu 1400 2>/dev/null || echo "Could not set MTU live (will still persist for next boot)."
-
-    cat > /etc/systemd/system/backhaul-mtu.service << EOF
+    ok "Config created: ${config_file}"
+    
+    # Install systemd service
+    local service_file="/etc/systemd/system/${service_name}.service"
+    cat > "$service_file" << EOF
 [Unit]
-Description=Pin MTU 1400 on ${iface} for Backhaul tunnel
-After=network-online.target
+Description=Backhaul Client (${service_name})
+After=network.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
-Type=oneshot
-ExecStart=/sbin/ip link set dev ${iface} mtu 1400
-RemainAfterExit=yes
+Type=simple
+User=root
+ExecStart=${BINARY} -c ${config_file}
+Restart=always
+RestartSec=1
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-1000
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable --now backhaul-mtu.service >/dev/null 2>&1
-    echo "MTU 1400 applied and will persist after reboot (backhaul-mtu.service)."
-}
-
-ensure_dns() {
+    systemctl enable "${service_name}" 2>/dev/null
+    systemctl restart "${service_name}"
+    sleep 2
+    
+    if systemctl is-active --quiet "${service_name}"; then
+        ok "✅ Service started successfully"
+    else
+        warn "⚠️  Service failed to start. Check logs:"
+        journalctl -u "${service_name}" -n 20 --no-pager
+    fi
+    
+    # Display summary
     echo ""
-    echo "=== Setting DNS to 1.1.1.1 / 1.0.0.1 / 8.8.8.8 ==="
-    if [ -L /etc/resolv.conf ]; then
-        rm -f /etc/resolv.conf
-    fi
-    cat > /etc/resolv.conf << EOF
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-nameserver 8.8.8.8
-EOF
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    echo "DNS set. (If this server uses systemd-resolved/NetworkManager, this file is now static/locked with chattr +i.)"
-}
-
-ensure_ulimits() {
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  Client installed successfully!${NC}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo "=== Raising file descriptor limits ==="
-    if ! grep -q "^fs.file-max" /etc/sysctl.d/99-backhaul-tunnel.conf 2>/dev/null; then
-        echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul-tunnel.conf
+    echo -e "  ${BOLD}Service:${NC}     ${service_name}"
+    echo -e "  ${BOLD}Transport:${NC}   ${transport}"
+    echo -e "  ${BOLD}Server:${NC}      ${server_ip}:${server_port}"
+    echo -e "  ${BOLD}Token:${NC}       ${token}"
+    echo -e "  ${BOLD}Config:${NC}      ${config_file}"
+    echo ""
+    echo -e "  ${DIM}Logs: journalctl -u ${service_name} -f${NC}"
+    echo ""
+    
+    if confirm "Install watchdog for auto-restart?" "y"; then
+        setup_watchdog
     fi
-    sysctl -w fs.file-max=2097152 > /dev/null 2>&1
-
-    if ! grep -q "backhaul-tunnel limits" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf << EOF
-
-# backhaul-tunnel limits
-root soft nofile 1048576
-root hard nofile 1048576
-* soft nofile 1048576
-* hard nofile 1048576
-EOF
+    
+    if confirm "Run system optimizer (BBR, buffers, etc.)?" "n"; then
+        optimize_system
     fi
-    ulimit -n 1048576 2>/dev/null || true
-    echo "File descriptor limits raised (takes full effect for new sessions/services)."
 }
+
+# ============================================================
+# Watchdog
+# ============================================================
+
+setup_watchdog() {
+    hr "Installing Watchdog"
+    ensure_dirs
+    mkdir -p "$WATCHDOG_STATE_DIR"
+    
+    cat > "$WATCHDOG_SCRIPT" << 'EOF'
+#!/bin/bash
+CONFIG_DIR="/root/backhaul-core/configs"
+STATE_DIR="/root/backhaul-core/watchdog-state"
+LOG_FILE="/root/backhaul-core/watchdog.log"
+IDLE_THRESHOLD=30
+
+mkdir -p "$STATE_DIR"
+
+for cfg in "$CONFIG_DIR"/*.toml; do
+    [ -f "$cfg" ] || continue
+    label=$(basename "$cfg" .toml)
+    unit="${label}.service"
+    [ -f "/etc/systemd/system/${unit}" ] || continue
+    
+    if ! systemctl is-active --quiet "$unit"; then
+        systemctl restart "$unit" 2>/dev/null
+        echo "$(date '+%F %T') restarted $unit (was inactive)" >> "$LOG_FILE"
+        rm -f "${STATE_DIR}/${unit}.last_ok"
+        continue
+    fi
+    
+    port=""
+    if grep -q '^\[server\]' "$cfg"; then
+        port=$(grep -oE 'bind_addr = "0\.0\.0\.0:[0-9]+"' "$cfg" | grep -oE '[0-9]+$')
+    else
+        port=$(grep -oE 'remote_addr = "[^:"]+:[0-9]+"' "$cfg" | grep -oE '[0-9]+$')
+    fi
+    [ -z "$port" ] && continue
+    
+    active_conns=$(ss -H -tn state established "( sport = :${port} or dport = :${port} )" 2>/dev/null | wc -l)
+    now=$(date +%s)
+    state_file="${STATE_DIR}/${unit}.last_ok"
+    
+    if [ "${active_conns:-0}" -gt 0 ]; then
+        echo "$now" > "$state_file"
+    else
+        last_ok=$(cat "$state_file" 2>/dev/null || echo "$now")
+        idle=$(( now - last_ok ))
+        if [ "$idle" -ge "$IDLE_THRESHOLD" ]; then
+            systemctl restart "$unit" 2>/dev/null
+            echo "$now" > "$state_file"
+            echo "$(date '+%F %T') restarted $unit (idle ${idle}s)" >> "$LOG_FILE"
+        fi
+    fi
+done
+EOF
+
+    chmod +x "$WATCHDOG_SCRIPT"
+    
+    cat > /etc/systemd/system/backhaul-watchdog.service << EOF
+[Unit]
+Description=Backhaul Watchdog
+[Service]
+Type=oneshot
+ExecStart=${WATCHDOG_SCRIPT}
+EOF
+
+    cat > /etc/systemd/system/backhaul-watchdog.timer << EOF
+[Unit]
+Description=Backhaul Watchdog Timer
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=10
+AccuracySec=1
+Unit=backhaul-watchdog.service
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now backhaul-watchdog.timer 2>/dev/null
+    
+    ok "Watchdog installed (checks every 10s)"
+}
+
+# ============================================================
+# System Optimization
+# ============================================================
 
 optimize_system() {
-    echo ""
-    echo "=== System Optimization ==="
-    local INTERFACE
-    INTERFACE=$(detect_default_iface)
-    echo "Interface: $INTERFACE"
-
-    sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_congestion_control=bbr > /dev/null 2>&1 && echo "BBR congestion control enabled." \
-        || echo "BBR module not available on this kernel — staying on the default (usually CUBIC)."
-
-    sysctl -w net.core.somaxconn=65535 > /dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=250000 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_local_port_range="1024 65535" > /dev/null 2>&1
-
-    sysctl -w net.core.rmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=134217728 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" > /dev/null 2>&1
-
-    sysctl -w net.ipv4.tcp_keepalive_time=60 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_intvl=10 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_keepalive_probes=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_user_timeout=30000 > /dev/null 2>&1
-
-    sysctl -w net.ipv4.tcp_fin_timeout=15 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_mtu_probing=1 > /dev/null 2>&1
-
-    sysctl -w net.ipv4.tcp_window_scaling=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_timestamps=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_sack=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_retries2=6 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_syn_retries=2 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_fastopen=3 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_low_latency=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0 > /dev/null 2>&1
-    sysctl -w net.ipv4.tcp_no_metrics_save=1 > /dev/null 2>&1
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-
-    # Deliberately NOT set (can backfire on newer kernels / behind NAT-CGNAT):
-    #   net.ipv4.tcp_tw_recycle   (removed in modern kernels)
-    #   net.ipv4.tcp_tw_reuse=1   (can break behind NAT/CGNAT)
-
-    cat > /etc/sysctl.d/99-backhaul-tunnel.conf << EOF
+    hr "System Optimization"
+    
+    local iface=$(detect_interface)
+    info "Interface: ${iface}"
+    
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
+    if sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        ok "BBR enabled"
+    else
+        warn "BBR not available"
+    fi
+    
+    sysctl -w net.core.somaxconn=65535 >/dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=250000 >/dev/null 2>&1
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
+    sysctl -w net.core.rmem_max=134217728 >/dev/null 2>&1
+    sysctl -w net.core.wmem_max=134217728 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728" >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 134217728" >/dev/null 2>&1
+    ok "Network buffers optimized"
+    
+    sysctl -w net.ipv4.tcp_keepalive_time=60 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_intvl=10 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_probes=6 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    ok "TCP optimized"
+    
+    ip link set dev "$iface" mtu 1400 2>/dev/null
+    ok "MTU set to 1400"
+    
+    ulimit -n 1048576 2>/dev/null
+    echo "fs.file-max=2097152" >> /etc/sysctl.d/99-backhaul.conf 2>/dev/null
+    ok "File descriptor limits raised"
+    
+    cat > /etc/sysctl.d/99-backhaul.conf << EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
@@ -1168,263 +863,269 @@ net.ipv4.tcp_wmem=4096 65536 134217728
 net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_intvl=10
 net.ipv4.tcp_keepalive_probes=6
-net.ipv4.tcp_user_timeout=30000
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_retries2=6
-net.ipv4.tcp_syn_retries=2
 net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_low_latency=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_no_metrics_save=1
 net.ipv4.ip_forward=1
 EOF
-    echo "Saved to /etc/sysctl.d/99-backhaul-tunnel.conf (persists across reboots)."
-
-    ensure_ulimits
-    ensure_mtu
-    ensure_dns
-
-    echo ""
-    echo "Optimization complete."
+    
+    ok "Optimization complete"
 }
 
 # ============================================================
-# Watchdog (health check + auto-restart)  — updated for multi-service layout
+# Management Functions
 # ============================================================
 
-setup_watchdog() {
+list_services() {
+    local services=()
+    for cfg in "$CONFIG_DIR"/*.toml; do
+        [ -f "$cfg" ] || continue
+        local name=$(basename "$cfg" .toml)
+        [ -f "/etc/systemd/system/${name}.service" ] && services+=("$name")
+    done
+    printf '%s\n' "${services[@]}" | sort -u
+}
+
+pick_service() {
+    local services=($(list_services))
+    if [ ${#services[@]} -eq 0 ]; then
+        warn "No services found"
+        return 1
+    fi
+    
+    if [ ${#services[@]} -eq 1 ]; then
+        SELECTED_SERVICE="${services[0]}"
+        return 0
+    fi
+    
     echo ""
-    echo "=== Installing Watchdog ==="
-    ensure_dirs
-    mkdir -p "$WATCHDOG_STATE_DIR"
-
-    cat > "$WATCHDOG_SCRIPT" << WDEOF
-#!/bin/bash
-INSTALL_DIR="${INSTALL_DIR}"
-CONFIG_DIR="${CONFIG_DIR}"
-STATE_DIR="${WATCHDOG_STATE_DIR}"
-LOG_FILE="${WATCHDOG_LOG}"
-IDLE_THRESHOLD=${WATCHDOG_IDLE_THRESHOLD}
-mkdir -p "\$STATE_DIR"
-
-for cfg in "\$CONFIG_DIR"/*.toml; do
-    [ -f "\$cfg" ] || continue
-    label=\$(basename "\$cfg" .toml)
-    unit="\${label}.service"
-    [ -f "/etc/systemd/system/\${unit}" ] || continue
-
-    if ! systemctl is-active --quiet "\$unit"; then
-        systemctl restart "\$unit" 2>/dev/null
-        echo "\$(date '+%F %T') restarted \$unit (service was inactive)" >> "\$LOG_FILE"
-        rm -f "\${STATE_DIR}/\${unit}.last_ok"
-        continue
-    fi
-
-    port=""
-    if grep -q '^\[server\]' "\$cfg"; then
-        port=\$(grep -oE 'bind_addr = "0\.0\.0\.0:[0-9]+"' "\$cfg" | grep -oE '[0-9]+\$')
-    else
-        port=\$(grep -oE 'remote_addr = "[^:"]+:[0-9]+"' "\$cfg" | grep -oE '[0-9]+\$')
-    fi
-    [ -z "\$port" ] && continue
-
-    active_conns=\$(ss -H -tn state established "( sport = :\${port} or dport = :\${port} )" 2>/dev/null | grep -c .)
-    now=\$(date +%s)
-    state_file="\${STATE_DIR}/\${unit}.last_ok"
-
-    if [ "\${active_conns:-0}" -gt 0 ]; then
-        echo "\$now" > "\$state_file"
-    else
-        last_ok=\$(cat "\$state_file" 2>/dev/null || echo "\$now")
-        idle=\$(( now - last_ok ))
-        if [ "\$idle" -ge "\$IDLE_THRESHOLD" ]; then
-            systemctl restart "\$unit" 2>/dev/null
-            echo "\$now" > "\$state_file"
-            echo "\$(date '+%F %T') restarted \$unit (idle \${idle}s, no established connections on port \${port})" >> "\$LOG_FILE"
+    echo -e "  ${BOLD}Services:${NC}"
+    for i in "${!services[@]}"; do
+        local status=$(systemctl is-active "${services[$i]}" 2>/dev/null)
+        if [ "$status" = "active" ]; then
+            echo -e "    $((i+1)))  ${services[$i]}  ${GREEN}● running${NC}"
+        else
+            echo -e "    $((i+1)))  ${services[$i]}  ${RED}○ stopped${NC}"
         fi
+    done
+    echo ""
+    
+    local choice
+    ask choice "Select service" "1"
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#services[@]} ]; then
+        SELECTED_SERVICE="${services[$((choice-1))]}"
+        return 0
     fi
-done
-WDEOF
-    chmod +x "$WATCHDOG_SCRIPT"
-
-    cat > /etc/systemd/system/backhaul-watchdog.service << EOF
-[Unit]
-Description=Backhaul Watchdog (health check / auto-restart)
-
-[Service]
-Type=oneshot
-ExecStart=${WATCHDOG_SCRIPT}
-EOF
-
-    cat > /etc/systemd/system/backhaul-watchdog.timer << 'EOF'
-[Unit]
-Description=Run Backhaul Watchdog every 10 seconds
-
-[Timer]
-OnBootSec=20
-OnUnitActiveSec=10
-AccuracySec=1
-Unit=backhaul-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now backhaul-watchdog.timer >/dev/null 2>&1
-    echo "Watchdog installed — checks every 10s, restarts a tunnel after ${WATCHDOG_IDLE_THRESHOLD}s with no active connections."
-    echo "Log: $WATCHDOG_LOG"
+    return 1
 }
 
-# ============================================================
-# Remove / uninstall
-# ============================================================
-
-uninstall_one_or_more() {
-    hr "Remove"
-    echo ""
-    mapfile -t SERVICES < <(list_services)
-    if [ ${#SERVICES[@]} -eq 0 ]; then
-        warn "No Backhaul services found."
+show_status() {
+    hr "Service Status"
+    local services=($(list_services))
+    if [ ${#services[@]} -eq 0 ]; then
+        warn "No services installed"
         return
     fi
-
-    echo "Installed services:"
-    for i in "${!SERVICES[@]}"; do
-        echo "  $((i+1)))  ${SERVICES[$i]}"
+    
+    for svc in "${services[@]}"; do
+        echo ""
+        echo -e "${BOLD}${svc}${NC}"
+        systemctl status "$svc" --no-pager --lines=5 2>/dev/null || true
+        echo "---"
     done
-    echo "  a)  Remove ALL"
-    echo ""
-    ask IDX "Select number (or a)" ""
-
-    local TARGETS=()
-    if [ "$IDX" = "a" ]; then
-        TARGETS=("${SERVICES[@]}")
-    else
-        if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVICES[@]} ]; then
-            warn "Invalid selection."
-            return
-        fi
-        TARGETS=("${SERVICES[$((IDX-1))]}")
-    fi
-
-    echo ""
-    warn "Will stop and remove: ${TARGETS[*]}"
-    ask CONFIRM "Confirm? (yes/no)" "no"
-    [ "$CONFIRM" != "yes" ] && { info "Cancelled."; return; }
-
-    for svc in "${TARGETS[@]}"; do
-        local label="${svc%.service}"
-        systemctl stop "$label" 2>/dev/null || true
-        systemctl disable "$label" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${label}.service"
-        rm -f "${CONFIG_DIR}/${label}.toml" "${CONFIG_DIR}/${label}.toml.bak"
-        rm -f "${CERTS_DIR}/${label}.crt" "${CERTS_DIR}/${label}.key"
-        rm -f "/etc/letsencrypt/renewal-hooks/deploy/backhaul-${label}.sh" 2>/dev/null || true
-        ok "Removed: ${label}"
-    done
-
-    systemctl daemon-reload
-    ok "Done."
 }
 
-uninstall_everything() {
+service_control() {
+    hr "Service Control"
+    if ! pick_service; then
+        return
+    fi
+    
+    local svc="$SELECTED_SERVICE"
+    echo ""
+    echo -e "  Selected: ${BOLD}${svc}${NC}"
+    echo ""
+    echo "  1)  Restart"
+    echo "  2)  Stop"
+    echo "  3)  Start"
+    echo "  4)  Status"
+    echo "  5)  View logs"
+    echo "  6)  Follow logs"
+    echo "  0)  Back"
+    echo ""
+    
+    local action
+    ask action "Action" "1"
+    
+    case "$action" in
+        1) systemctl restart "$svc" && ok "Restarted" || error "Failed" ;;
+        2) systemctl stop "$svc" && ok "Stopped" || error "Failed" ;;
+        3) systemctl start "$svc" && ok "Started" || error "Failed" ;;
+        4) systemctl status "$svc" --no-pager ;;
+        5) journalctl -u "$svc" -n 50 --no-pager ;;
+        6) journalctl -u "$svc" -f ;;
+        0|"") return ;;
+    esac
+}
+
+edit_config() {
+    hr "Edit Config"
+    if ! pick_service; then
+        return
+    fi
+    
+    local config="${CONFIG_DIR}/${SELECTED_SERVICE}.toml"
+    if [ ! -f "$config" ]; then
+        warn "Config not found: $config"
+        return
+    fi
+    
+    local editor="${EDITOR:-}"
+    [ -z "$editor" ] && command -v nano >/dev/null && editor="nano"
+    [ -z "$editor" ] && command -v vim >/dev/null && editor="vim"
+    [ -z "$editor" ] && command -v vi >/dev/null && editor="vi"
+    
+    if [ -z "$editor" ]; then
+        warn "No editor found. Install nano: apt install nano"
+        return
+    fi
+    
+    cp "$config" "${config}.bak"
+    info "Editing: $config"
+    "$editor" "$config"
+    
+    if confirm "Restart service to apply changes?" "y"; then
+        systemctl restart "$SELECTED_SERVICE"
+        if systemctl is-active --quiet "$SELECTED_SERVICE"; then
+            ok "Service running with new config"
+        else
+            warn "Service failed to start"
+            if confirm "Revert to backup?" "y"; then
+                cp "${config}.bak" "$config"
+                systemctl restart "$SELECTED_SERVICE"
+                ok "Reverted to backup"
+            fi
+        fi
+    fi
+}
+
+remove_service() {
+    hr "Remove Service"
+    if ! pick_service; then
+        return
+    fi
+    
+    local svc="$SELECTED_SERVICE"
+    if ! confirm "Remove ${svc}?" "n"; then
+        return
+    fi
+    
+    systemctl stop "$svc" 2>/dev/null
+    systemctl disable "$svc" 2>/dev/null
+    rm -f "/etc/systemd/system/${svc}.service"
+    rm -f "${CONFIG_DIR}/${svc}.toml"
+    rm -f "${CONFIG_DIR}/${svc}.toml.bak"
+    rm -f "${CERTS_DIR}/${svc}.crt" "${CERTS_DIR}/${svc}.key"
+    systemctl daemon-reload
+    
+    ok "Removed: $svc"
+}
+
+update_binary() {
+    hr "Update Binary"
+    download_backhaul
+}
+
+uninstall_all() {
     hr "Full Uninstall"
-    echo ""
-    read -p "This will remove ALL Backhaul services, the watchdog, and the MTU unit on THIS server. Continue? (y/n): " CONFIRM
-    if [ "$CONFIRM" != "y" ]; then
-        info "Cancelled."
+    if ! confirm "Remove ALL Backhaul services and files?" "n"; then
         return
     fi
-
-    mapfile -t SERVICES < <(list_services)
-    for svc in "${SERVICES[@]}"; do
-        local label="${svc%.service}"
-        systemctl disable --now "$label" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/${label}.service"
+    
+    local services=($(list_services))
+    for svc in "${services[@]}"; do
+        systemctl stop "$svc" 2>/dev/null
+        systemctl disable "$svc" 2>/dev/null
+        rm -f "/etc/systemd/system/${svc}.service"
     done
-    systemctl disable --now backhaul-watchdog.timer >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/backhaul-watchdog.timer /etc/systemd/system/backhaul-watchdog.service
-    systemctl disable --now backhaul-mtu.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/backhaul-mtu.service
-
+    
+    systemctl stop backhaul-watchdog.timer 2>/dev/null
+    systemctl disable backhaul-watchdog.timer 2>/dev/null
+    rm -f /etc/systemd/system/backhaul-watchdog.{service,timer}
+    
     systemctl daemon-reload
     rm -rf "$INSTALL_DIR"
-    ok "Uninstalled. (Note: MTU/DNS/sysctl system tuning was left in place — revert manually if needed.)"
+    
+    ok "All Backhaul files removed"
 }
 
 # ============================================================
-# Menu
+# Main Menu
 # ============================================================
 
 show_banner() {
+    clear 2>/dev/null || true
     echo ""
-    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v10"
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║           BACKHAUL TUNNEL MANAGER v13                    ║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${DIM}Default tunnel port: 2020 → forwards to 22${NC}"
     echo ""
 }
 
 show_menu() {
-    echo -e "${BOLD}  Select an option:${NC}"
-    echo ""
-    echo -e "  ${BOLD}Install${NC}"
+    echo -e "${BOLD}  ─── Installation ───${NC}"
     echo "    1)  Install Server (Iran side)"
     echo "    2)  Install Client (Kharej side)"
     echo ""
-    echo -e "  ${BOLD}Manage${NC}"
+    echo -e "${BOLD}  ─── Management ───${NC}"
     echo "    3)  Service Status"
-    echo "    4)  Service Control  (restart/stop/start)"
+    echo "    4)  Service Control (start/stop/restart)"
     echo "    5)  Edit Config"
-    echo "    6)  Manage Inbound Ports (server side)"
+    echo "    6)  Remove Service"
     echo ""
-    echo -e "  ${BOLD}Logs${NC}"
-    echo "    7)  View Logs        (last 80 lines)"
-    echo "    8)  Live Logs        (follow)"
+    echo -e "${BOLD}  ─── System ───${NC}"
+    echo "    7)  System Optimizer"
+    echo "    8)  Watchdog (auto-restart)"
+    echo "    9)  Update Binary"
+    echo "   10)  Full Uninstall"
     echo ""
-    echo -e "  ${BOLD}System${NC}"
-    echo "    9)  System Optimizer (BBR + buffers + MTU + DNS + ulimits)"
-    echo "   10)  Install/repair Watchdog"
-    echo ""
-    echo -e "  ${BOLD}Other${NC}"
-    echo "   11)  Remove a service"
-    echo "   12)  Full uninstall (everything)"
-    echo "   13)  Update Core (Binary)"
     echo "    0)  Exit"
     echo ""
-    ask CHOICE "Choice" ""
 }
 
-pause() {
+pause_menu() {
     echo ""
-    echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: "
+    echo -ne "${YELLOW}Press Enter to continue...${NC}"
     read -r _
 }
 
+# ============================================================
+# Main Loop
+# ============================================================
+
 while true; do
-    clear 2>/dev/null || true
     show_banner
     show_menu
-
-    case "$CHOICE" in
-        1)  install_server ;;
-        2)  install_client ;;
-        3)  show_status ;;
-        4)  service_control ;;
-        5)  edit_config ;;
-        6)  manage_ports ;;
-        7)  show_logs ;;
-        8)  show_logs_live ;;
-        9)  optimize_system ;;
-        10) setup_watchdog ;;
-        11) uninstall_one_or_more ;;
-        12) uninstall_everything ;;
-        13) download_backhaul ;;
-        0)  echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
-        *)  warn "Invalid choice: ${CHOICE}" ;;
+    
+    local choice
+    ask choice "Select option" "0"
+    
+    case "$choice" in
+        1) install_server ;;
+        2) install_client ;;
+        3) show_status ;;
+        4) service_control ;;
+        5) edit_config ;;
+        6) remove_service ;;
+        7) optimize_system ;;
+        8) setup_watchdog ;;
+        9) update_binary ;;
+        10) uninstall_all ;;
+        0) echo -e "\n  ${CYAN}Goodbye!${NC}\n"; exit 0 ;;
+        *) warn "Invalid option: $choice" ;;
     esac
-
-    pause
+    
+    pause_menu
 done
