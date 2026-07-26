@@ -1,7 +1,32 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager — v11
+# Backhaul Tunnel Manager — v13
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
+#
+# v13 addition vs v12 (root-caused a real "hangs on Connecting" report):
+#   - Port 1080 (and other widely fingerprinted proxy/VPN ports: 8080, 3128,
+#     8388, 1194, 51820, 500, 4500) get flagged wherever a port is entered
+#     (install_server's ask_ports, and Manage Inbound Ports' "Add a port").
+#     DPI filtering commonly throttles/blocks these by port number alone,
+#     independent of Backhaul or this script -- a script can't force a
+#     network in the middle to stop dropping a specific port. What it CAN
+#     do, and now does: offer to expose the same backend on a random,
+#     unremarkable port instead (e.g. 41287=1080), which keeps the internal
+#     target port unchanged. Diagnose Tunnel also flags any already
+#     configured port that's on this list.
+#
+# v12 additions vs v11:
+#   - Install Client now asks how many Iran servers to connect to at once.
+#     For 1, behavior is unchanged. For more than 1, it creates one
+#     independent client service per server (named <base>-ir1, <base>-ir2,
+#     ...), each with its own remote_addr and (optionally) its own token,
+#     all sharing the chosen transport and tuning profile. This matches how
+#     Backhaul actually works -- one client process talks to one server, so
+#     "connect to 3 Iran servers at once" means running 3 client services in
+#     parallel, which this now automates instead of requiring 3 manual runs
+#     through the installer.
+#   - After a multi-server install, watchdog/optimizer/diagnose all run
+#     against every created service, not just one.
 #
 # v11 additions vs v10 (based on a real debugging session):
 #   - New "Diagnose Tunnel" menu option (and offered automatically right
@@ -471,6 +496,52 @@ ask_transport() {
 # Ports
 # ============================================================
 
+# Ports that are commonly fingerprinted/throttled by DPI purely because of
+# their number (independent of Backhaul/this script) -- widely recognized
+# defaults for SOCKS5, HTTP proxies, VPN protocols, etc.
+FLAGGED_PORTS="1080 8080 3128 8388 1194 51820 500 4500"
+
+is_flagged_port() {
+    local p="$1"
+    for fp in $FLAGGED_PORTS; do
+        [ "$p" = "$fp" ] && return 0
+    done
+    return 1
+}
+
+# Given a port entry ("1080" or "9000=1080"), checks if the externally
+# exposed (bind) side is a widely fingerprinted port, and if so offers to
+# swap it for a random one while keeping the same internal target. Prints
+# the (possibly modified) entry to stdout.
+maybe_randomize_flagged_port() {
+    local entry="$1"
+    local bindp targetp
+    if [[ "$entry" == *"="* ]]; then
+        bindp="${entry%%=*}"
+        targetp="${entry#*=}"
+    else
+        bindp="$entry"
+        targetp="$entry"
+    fi
+
+    if is_flagged_port "$bindp"; then
+        echo "" >&2
+        warn "Port ${bindp} is a widely recognized proxy/VPN port and is commonly" >&2
+        warn "throttled or blocked by DPI filtering based on the port number alone" >&2
+        warn "-- this is independent of Backhaul or this script." >&2
+        local suggestion
+        suggestion=$(gen_port)
+        local USE_RANDOM
+        ask USE_RANDOM "Expose it on random port ${suggestion} instead (still forwards to :${targetp})? (y/n)" "y" >&2
+        if [ "$USE_RANDOM" = "y" ] || [ "$USE_RANDOM" = "Y" ]; then
+            ok "Using ${suggestion}=${targetp} instead of ${bindp}." >&2
+            echo "${suggestion}=${targetp}"
+            return
+        fi
+    fi
+    echo "$entry"
+}
+
 ask_ports() {
     echo ""
     echo -e "  Ports to forward. One per line, or comma-separated. Empty line when done."
@@ -494,6 +565,11 @@ ask_ports() {
         warn "No ports defined. Adding default 2222=22."
         PORTS=("2222=22")
     fi
+
+    local i
+    for i in "${!PORTS[@]}"; do
+        PORTS[$i]=$(maybe_randomize_flagged_port "${PORTS[$i]}")
+    done
 }
 
 build_ports_toml() {
@@ -804,69 +880,113 @@ install_client() {
     ensure_binary || return
     echo ""
 
-    ask_service_name
-    echo ""
-
-    ask_transport
-    warn "This MUST be the exact same transport chosen on the server (tcp/tcpmux/ws/wsmux/wss/wssmux)."
-    warn "A mismatch here is the #1 cause of 'invalid signal received for channel' / connection timeouts."
-    echo ""
-
-    local SERVER_IP SERVER_PORT
-    while true; do
-        echo -e "        Example : 1.1.1.1:8443"
-        ask SERVER_ADDR "Server IP And Port" ""
-        SERVER_IP="${SERVER_ADDR%%:*}"
-        SERVER_PORT="${SERVER_ADDR##*:}"
-        if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
-            warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
-        else
-            break
-        fi
+    ask NUM_SERVERS "How many Iran servers should this client connect to simultaneously?" "1"
+    while ! [[ "$NUM_SERVERS" =~ ^[0-9]+$ ]] || [ "$NUM_SERVERS" -lt 1 ]; do
+        warn "Enter a whole number, 1 or higher."
+        ask NUM_SERVERS "How many Iran servers should this client connect to simultaneously?" "1"
     done
     echo ""
 
-    ask TOKEN "Token / PSK  (must match the server)" "$FIXED_TOKEN"
+    local BASE_LABEL=""
+    if [ "$NUM_SERVERS" -eq 1 ]; then
+        ask_service_name
+    else
+        info "Each Iran server gets its own tunnel process/service on this machine,"
+        info "named <base>-ir1, <base>-ir2, ... -- they run independently and in parallel."
+        while true; do
+            ask BASE_LABEL "Base Service Name (e.g. khare1)" ""
+            if [ -z "$BASE_LABEL" ]; then
+                warn "Base Service Name cannot be empty."
+                continue
+            fi
+            if ! validate_label "$BASE_LABEL"; then
+                warn "Only letters, numbers, - and _ are allowed."
+                continue
+            fi
+            break
+        done
+    fi
+    echo ""
+
+    ask_transport
+    warn "This MUST be the exact same transport chosen on each Iran server (tcp/tcpmux/ws/wsmux/wss/wssmux)."
+    warn "A mismatch here is the #1 cause of 'invalid signal received for channel' / connection timeouts."
+    echo ""
+
+    ask TOKEN "Default Token / PSK  (used for every server below unless you override it)" "$FIXED_TOKEN"
     echo ""
 
     if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "wssmux" ]; then
-        warn "This client connects over TLS. If the server uses a self-signed"
+        warn "This client connects over TLS. If a server uses a self-signed"
         warn "certificate, the handshake may be rejected — use Automatic or"
-        warn "Custom SSL on the server side if the client fails to connect."
+        warn "Custom SSL on that server if the client fails to connect to it."
         echo ""
     fi
 
     ask_advanced
     echo ""
 
-    write_client_config "$CONFIG" "$SERVER_IP" "$SERVER_PORT" "$TOKEN" "$TRANSPORT"
-    ok "Config written: ${CONFIG}"
+    local CREATED=()
+    local i
+    for ((i=1; i<=NUM_SERVERS; i++)); do
+        if [ "$NUM_SERVERS" -gt 1 ]; then
+            hr "Iran Server #$i of $NUM_SERVERS"
+            SERVICE_NAME="${BASE_LABEL}-ir${i}"
+            SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+            CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.toml"
+            if [ -f "$SERVICE_FILE" ] || [ -f "$CONFIG" ]; then
+                warn "Already exists: ${SERVICE_NAME} -- it will be overwritten."
+            fi
+            info "Service Name : ${SERVICE_NAME}"
+        fi
 
-    install_service
-    start_service
+        local SERVER_IP SERVER_PORT SERVER_TOKEN
+        while true; do
+            echo -e "        Example : 1.1.1.1:8443"
+            ask SERVER_ADDR "Server #$i IP And Port" ""
+            SERVER_IP="${SERVER_ADDR%%:*}"
+            SERVER_PORT="${SERVER_ADDR##*:}"
+            if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
+                warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+            else
+                break
+            fi
+        done
+        ask SERVER_TOKEN "Token for server #$i" "$TOKEN"
+
+        write_client_config "$CONFIG" "$SERVER_IP" "$SERVER_PORT" "$SERVER_TOKEN" "$TRANSPORT"
+        ok "Config written: ${CONFIG}"
+
+        install_service
+        start_service
+        CREATED+=("${SERVICE_NAME}.service|${SERVER_IP}:${SERVER_PORT}")
+        echo ""
+    done
 
     echo ""
-    echo -e "${GREEN}${BOLD}  Client installed successfully.${NC}"
+    echo -e "${GREEN}${BOLD}  ${#CREATED[@]} client tunnel(s) installed.${NC}"
     echo ""
-    echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
+    for c in "${CREATED[@]}"; do
+        echo -e "  ${BOLD}${c%%|*}${NC}  ->  ${c#*|}"
+    done
+    echo ""
     echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
-    echo -e "  Server    : ${BOLD}${SERVER_IP}:${SERVER_PORT}${NC}"
-    echo -e "  Token     : ${BOLD}${TOKEN}${NC}"
-    echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
-    echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
+    echo -e "  Logs      : journalctl -u <service-name> -f"
     echo ""
 
     ask RUNOPT "Run system optimizer now (BBR, buffers, MTU, DNS, ulimits)? (y/n)" "n"
     [ "$RUNOPT" = "y" ] || [ "$RUNOPT" = "Y" ] && optimize_system
 
-    ask RUNWD "Install/refresh the watchdog (auto-restart on dead/idle tunnel)? (y/n)" "y"
+    ask RUNWD "Install/refresh the watchdog (auto-restart on dead/idle tunnels)? (y/n)" "y"
     [ "$RUNWD" = "y" ] || [ "$RUNWD" = "Y" ] && setup_watchdog
 
     echo ""
-    ask RUNDIAG "Run a quick connection diagnosis now? (y/n)" "y"
+    ask RUNDIAG "Run a quick connection diagnosis for each service now? (y/n)" "y"
     if [ "$RUNDIAG" = "y" ] || [ "$RUNDIAG" = "Y" ]; then
         sleep 2
-        diagnose_service "${SERVICE_NAME}.service"
+        for c in "${CREATED[@]}"; do
+            diagnose_service "${c%%|*}"
+        done
     fi
 }
 
@@ -975,6 +1095,12 @@ diagnose_service() {
                     ok "  ${fp}  -- listening locally on this server (traffic arriving here gets tunneled to the client)."
                 else
                     warn "  ${fp}  -- NOT listening here. Restart the service or check the config."
+                fi
+                if is_flagged_port "$bindp"; then
+                    warn "    -- ${bindp} is a well-known proxy/VPN port; if THIS port hangs on"
+                    warn "       'connecting' while others work fine, DPI targeting the port"
+                    warn "       number itself (not this script) is the likely cause. Consider"
+                    warn "       remapping it via 'Manage Inbound Ports' to a random port."
                 fi
             done
             echo ""
@@ -1160,7 +1286,10 @@ manage_ports() {
 
     if [ "$PCHOICE" = "1" ]; then
         ask NEWPORT "Port to add  (e.g. 2050 or 2222=22)" ""
-        [ -n "$NEWPORT" ] && CURPORTS+=("$NEWPORT")
+        if [ -n "$NEWPORT" ]; then
+            NEWPORT=$(maybe_randomize_flagged_port "$NEWPORT")
+            CURPORTS+=("$NEWPORT")
+        fi
     else
         ask OLDPORT "Port to remove" ""
         local tmp=()
@@ -1506,7 +1635,7 @@ uninstall_everything() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v11"
+    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v13"
     echo ""
 }
 
@@ -1515,7 +1644,7 @@ show_menu() {
     echo ""
     echo -e "  ${BOLD}Install${NC}"
     echo "    1)  Install Server (Iran side)"
-    echo "    2)  Install Client (Kharej side)"
+    echo "    2)  Install Client (Kharej side, 1 or many Iran servers)"
     echo ""
     echo -e "  ${BOLD}Manage${NC}"
     echo "    3)  Service Status"
