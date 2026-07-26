@@ -1,7 +1,24 @@
 #!/bin/bash
 
-# Backhaul Tunnel Manager — v13
+# Backhaul Tunnel Manager — v14
 # Official Musixal/Backhaul release binary — encrypted reverse port forwarding.
+#
+# v14 additions vs v13 (root-caused a real recurring-disconnect report):
+#   - New "unstable_network" tuner profile: for links where the control
+#     channel gets cut with "read: connection timed out" at a very regular
+#     interval (commonly ~90-100s) regardless of the previous keepalive
+#     settings -- almost always a NAT/firewall idle-connection-tracking
+#     timeout, or active filtering, on the path between the two servers,
+#     not a bug in Backhaul or this script. This profile pushes
+#     heartbeat/keepalive well below that window (heartbeat=5s,
+#     keepalive_period=8s) so reconnects are both less likely and faster
+#     when they do happen.
+#   - Diagnose Tunnel now scans the last 10 minutes of logs for repeated
+#     "restarting client/server" events and, if found, points directly at
+#     this profile instead of leaving the person to guess.
+#   - Diagnose Tunnel (client role) now prints the full list of locally
+#     listening ports automatically, instead of just suggesting the command
+#     -- makes it immediate to compare against the server's forwarded ports.
 #
 # v13 addition vs v12 (root-caused a real "hangs on Connecting" report):
 #   - Port 1080 (and other widely fingerprinted proxy/VPN ports: 8080, 3128,
@@ -623,28 +640,41 @@ apply_profile() {
             ADV_KEEPALIVE=60  ADV_HEARTBEAT=30 ADV_CHANNEL_SIZE=1024  ADV_MUX_CON=2
             ADV_CONN_POOL=2   ADV_AGGRESSIVE_POOL=false ADV_RETRY_INTERVAL=5 ADV_LOG_LEVEL="info"
             ;;
+        unstable_network)
+            # For links where something on the path (NAT/firewall connection
+            # tracking, or active filtering) kills idle-looking TCP flows
+            # after roughly 90-100s regardless of TCP keepalive. Heartbeat
+            # and keepalive are kept well under that window so the channel
+            # either never looks idle, or reconnects as fast as possible
+            # when it's cut anyway.
+            ADV_KEEPALIVE=8   ADV_HEARTBEAT=5  ADV_CHANNEL_SIZE=8192  ADV_MUX_CON=8
+            ADV_CONN_POOL=8   ADV_AGGRESSIVE_POOL=true  ADV_RETRY_INTERVAL=1 ADV_LOG_LEVEL="warn"
+            ;;
     esac
 }
 
 ask_advanced() {
     echo ""
     echo -e "  ${BOLD}Tuner Profile:${NC}"
-    echo "    1)  auto         — Recommended low-latency defaults"
-    echo "    2)  stable       — Balanced, conservative for most setups"
-    echo "    3)  aggressive   — Max throughput, higher memory usage"
-    echo "    4)  low_latency  — Minimum delay, small buffers"
-    echo "    5)  low_hardware — Weak VPS / low RAM"
-    echo "    6)  custom       — Set every value manually"
+    echo "    1)  auto             — Recommended low-latency defaults"
+    echo "    2)  stable           — Balanced, conservative for most setups"
+    echo "    3)  aggressive       — Max throughput, higher memory usage"
+    echo "    4)  low_latency      — Minimum delay, small buffers"
+    echo "    5)  low_hardware     — Weak VPS / low RAM"
+    echo "    6)  unstable_network — Link drops the control channel every ~90s"
+    echo "                          (NAT/firewall idle-timeout or active filtering)"
+    echo "    7)  custom           — Set every value manually"
     echo ""
     ask ADV_CHOICE "Tuner Profile" "1"
     echo ""
     case "$ADV_CHOICE" in
-        1|auto)         apply_profile "auto" ;;
-        2|stable)       apply_profile "stable" ;;
-        3|aggressive)   apply_profile "aggressive" ;;
-        4|low_latency)  apply_profile "low_latency" ;;
-        5|low_hardware) apply_profile "low_hardware" ;;
-        6|custom)
+        1|auto)             apply_profile "auto" ;;
+        2|stable)           apply_profile "stable" ;;
+        3|aggressive)       apply_profile "aggressive" ;;
+        4|low_latency)      apply_profile "low_latency" ;;
+        5|low_hardware)     apply_profile "low_hardware" ;;
+        6|unstable_network) apply_profile "unstable_network" ;;
+        7|custom)
             ADV_PROFILE="custom"
             ask ADV_KEEPALIVE       "keepalive_period    (sec)"   "20"
             ask ADV_HEARTBEAT       "heartbeat           (sec)"   "15"
@@ -1083,6 +1113,19 @@ diagnose_service() {
             warn "  - On the client side, remote_addr must point to THIS IP:${bind_port} exactly."
         fi
 
+        local restart_count
+        restart_count=$(journalctl -u "$svc" --since "-10min" --no-pager 2>/dev/null | grep -c "restarting client\|restarting server")
+        if [ "${restart_count:-0}" -ge 3 ]; then
+            echo ""
+            warn "The control channel has reconnected ${restart_count} times in the last 10 minutes."
+            warn "If these repeat at a very regular interval (check with the command below),"
+            warn "something on the network path is likely killing idle-looking TCP flows --"
+            warn "a NAT/firewall connection-tracking timeout or active filtering, not this"
+            warn "script. Try the 'unstable_network' tuner profile (Edit Config, or reinstall"
+            warn "choosing it) which lowers heartbeat/keepalive well below typical timeout windows."
+            echo "       journalctl -u ${svc} --no-pager | grep -E 'restarting|read tcp'"
+        fi
+
         echo ""
         echo "=== Forwarded ports (this server) ==="
         mapfile -t FPORTS < <(sed -n '/ports = \[/,/\]/p' "$cfg" | grep -oE '"[^"]+"' | tr -d '"')
@@ -1136,13 +1179,25 @@ diagnose_service() {
             echo "       cat ${cfg}"
         fi
 
+        local restart_count
+        restart_count=$(journalctl -u "$svc" --since "-10min" --no-pager 2>/dev/null | grep -c "restarting client\|restarting server")
+        if [ "${restart_count:-0}" -ge 3 ]; then
+            echo ""
+            warn "The control channel has reconnected ${restart_count} times in the last 10 minutes."
+            warn "If these repeat at a very regular interval (check with the command below),"
+            warn "something on the network path is likely killing idle-looking TCP flows --"
+            warn "a NAT/firewall connection-tracking timeout or active filtering, not this"
+            warn "script. Try the 'unstable_network' tuner profile (Edit Config, or reinstall"
+            warn "choosing it) which lowers heartbeat/keepalive well below typical timeout windows."
+            echo "       journalctl -u ${svc} --no-pager | grep -E 'restarting|read tcp'"
+        fi
+
         echo ""
-        echo "=== Reminder: backend services on THIS machine ==="
+        echo "=== Backend services currently listening on THIS machine ==="
         warn "Whatever ports the server forwards, Backhaul on this client tries to reach"
-        warn "them at 127.0.0.1:<port> on THIS machine. If nothing is listening on those"
-        warn "ports here, connections will fail with 'connection refused' even though the"
-        warn "tunnel itself is healthy. Check what's listening here with:"
-        echo "       ss -tlnp"
+        warn "them at 127.0.0.1:<port> on THIS machine. Compare this list against the"
+        warn "server's forwarded ports (run Diagnose on the SERVER service to see them):"
+        ss -tlnp 2>/dev/null | tail -n +2
     fi
     echo ""
 }
@@ -1635,7 +1690,7 @@ uninstall_everything() {
 
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v13"
+    echo -e "  ${CYAN}${BOLD}Backhaul Tunnel Manager${NC}  -  v14"
     echo ""
 }
 
