@@ -200,12 +200,12 @@ EOF
 }
 
 prompt_protocol() {
-    echo -e "${C_GREEN}Select the protocol:${C_RESET}"
-    echo -e "${C_CYAN}1. ${C_RESET}tcp"
-    echo -e "${C_CYAN}2. ${C_RESET}udp"
-    echo -e "${C_CYAN}3. ${C_RESET}grpc"
-    echo -e "${C_CYAN}4. ${C_RESET}ws   (WebSocket - looks like normal HTTP traffic)"
-    echo -e "${C_CYAN}5. ${C_RESET}wss  (WebSocket over TLS - looks like normal HTTPS traffic, hardest to fingerprint)"
+    echo -e "${C_GREEN}Select the protocol:${C_RESET}" >&2
+    echo -e "${C_CYAN}1. ${C_RESET}tcp" >&2
+    echo -e "${C_CYAN}2. ${C_RESET}udp" >&2
+    echo -e "${C_CYAN}3. ${C_RESET}grpc" >&2
+    echo -e "${C_CYAN}4. ${C_RESET}ws   (WebSocket - looks like normal HTTP traffic)" >&2
+    echo -e "${C_CYAN}5. ${C_RESET}wss  (WebSocket over TLS - looks like normal HTTPS traffic, hardest to fingerprint)" >&2
     local opt
     opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 5)
     case "$opt" in
