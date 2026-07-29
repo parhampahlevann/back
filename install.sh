@@ -196,7 +196,22 @@ EOF
         systemctl restart "${this_unit}.service"
     done
 
+    apply_mss_clamp
+
     echo -e "${C_GREEN}Tunnel configuration applied (${file_count} service unit(s)).${C_RESET}"
+}
+
+# TLS/WebSocket framing adds bytes on top of the real payload; if a packet then
+# exceeds path MTU it gets fragmented or silently dropped by routers that block
+# fragments - a common cause of "works but unstable/slow" over wss/mwss/grpc.
+# Clamping MSS to the actual path MTU avoids this without needing to know the
+# exact MTU in advance.
+apply_mss_clamp() {
+    command -v iptables &>/dev/null || return 0
+    if ! iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+        echo -e "${C_GREEN}MSS clamping enabled (reduces fragmentation-related packet loss).${C_RESET}"
+    fi
 }
 
 prompt_protocol() {
@@ -205,14 +220,16 @@ prompt_protocol() {
     echo -e "${C_CYAN}2. ${C_RESET}udp" >&2
     echo -e "${C_CYAN}3. ${C_RESET}grpc" >&2
     echo -e "${C_CYAN}4. ${C_RESET}ws   (WebSocket - looks like normal HTTP traffic)" >&2
-    echo -e "${C_CYAN}5. ${C_RESET}wss  (WebSocket over TLS - looks like normal HTTPS traffic, hardest to fingerprint)" >&2
+    echo -e "${C_CYAN}5. ${C_RESET}wss  (WebSocket over TLS - looks like normal HTTPS traffic, hardest to fingerprint, more CPU cost)" >&2
+    echo -e "${C_CYAN}6. ${C_RESET}mwss (multiplexed wss - same stealth as wss, but one TLS handshake shared across many streams: much faster/more stable under real traffic)" >&2
     local opt
-    opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 5)
+    opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 6)
     case "$opt" in
         1) echo "tcp" ;;
         2) echo "udp" ;;
         3) echo "grpc" ;;
         4) echo "ws" ;;
+        6) echo "mwss" ;;
         5) echo "wss" ;;
     esac
 }
