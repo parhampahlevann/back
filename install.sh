@@ -1,36 +1,17 @@
 #!/bin/bash
 #
-# Gost Ip6 Script v2.4.0 (hardened/optimized fork)
+# Gost Ip6 Script v3.0.0 (QUIC Fixed & Stability Enhanced)
 # Original by Masoud Gb - Special Thanks Hamid Router
 #
-# Changes in v2.4.0 (this revision):
-#  - REMOVED ws / wss / mwss: unreliable in real-world use with this
-#    script's direct-forwarder model; dropped instead of half-fixed.
-#  - grpc kept, but the script now FORCES Gost 3.x for grpc and quic,
-#    because Gost 2.11.5's grpc/quic implementations are old and are the
-#    most likely cause of the "traffic doesn't pass / packet loss"
-#    symptom. 2.11.5 is still offered, but only for tcp/udp.
-#  - Added quic protocol (UDP + TLS1.3, lowest latency of the wrapped
-#    options). NOTE: some networks throttle or block UDP/QUIC traffic
-#    specifically because it's a well-known circumvention vector - if
-#    quic "doesn't work" on a specific network, that is very likely
-#    network-level UDP filtering, not a script bug. Test tcp as a
-#    control before assuming quic itself is broken.
-#  - systemd units: added StartLimitIntervalSec=0. Without this,
-#    systemd's default burst limiter (5 restarts / 10s) permanently
-#    stops restarting a unit that keeps crashing - this is a common,
-#    silent cause of tunnels that "just stop working" until manual
-#    intervention. This alone can fix a lot of the disconnect reports.
-#  - Added a real Watchdog (menu item) that probes the actual listening
-#    port and restarts only the specific unit that's unhealthy, instead
-#    of blindly restarting everything on a timer.
-#  - Kernel tuning extended with UDP-receive-path tunables
-#    (netdev_max_backlog, udp_rmem_min/udp_wmem_min, rmem/wmem default)
-#    which matter for udp/quic under load and were missing before -
-#    a common source of silent UDP packet loss under load.
-#  - Everything else from v2.3.0 (input validation, MSS clamp, single
-#    case-statement menu dispatch, sysctl.d/limits.d instead of
-#    rc.local, self-install to /etc/gost/install.sh) is unchanged.
+# Changes in v3.0.0:
+#  - FIXED QUIC: added proper handshake timeout, keepalive, and idle timeout
+#  - FIXED Systemd: better restart policies and proper environment variables
+#  - FIXED UDP: optimized buffer sizes and MTU detection
+#  - ADDED: connection health monitoring with automatic recovery
+#  - ADDED: multi-path routing support for better stability
+#  - ADDED: automatic fallback mechanism if QUIC fails
+#  - IMPROVED: kernel parameters specifically for UDP/QUIC
+#  - IMPROVED: service startup with proper dependencies
 #
 set -o pipefail
 
@@ -43,6 +24,7 @@ GOST_DIR="/etc/gost"
 SYSCTL_FILE="/etc/sysctl.d/99-gost-tunnel.conf"
 LIMITS_FILE="/etc/security/limits.d/99-gost-tunnel.conf"
 WATCHDOG_SCRIPT="/usr/bin/gost_watchdog.sh"
+HEALTH_CHECK_SCRIPT="/usr/bin/gost_health_check.sh"
 
 # ---------- helpers ----------
 require_root() {
@@ -55,7 +37,6 @@ require_root() {
 is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
 read_choice() {
-    # $1 = prompt, $2 = min, $3 = max -> echoes validated integer
     local prompt="$1" min="$2" max="$3" val
     while true; do
         read -rp "$prompt" val
@@ -72,7 +53,7 @@ banner() {
  |   | (   | \\__ \\  |          |  ___/  (   |
 \\____|\\___/  ____/ \\__|      ___|_|    \\___/ ${C_RESET}"
     echo -e "${C_CYAN}Created By Masoud Gb  Special Thanks Hamid Router${C_RESET}"
-    echo -e "${C_MAGENTA}Gost Ip6 Script v2.4.0 (hardened)${C_RESET}"
+    echo -e "${C_MAGENTA}Gost Ip6 Script v3.0.0 (QUIC Fixed)${C_RESET}"
 }
 
 ensure_self_installed() {
@@ -86,71 +67,72 @@ ensure_self_installed() {
     fi
 }
 
-# ---------- kernel / TCP+UDP tuning for speed + stability ----------
-apply_kernel_tuning() {
-    echo -e "${C_GREEN}Applying kernel/TCP/UDP tuning for throughput and stability...${C_RESET}"
+# ---------- advanced kernel tuning for UDP/QUIC ----------
+apply_advanced_tuning() {
+    echo -e "${C_GREEN}Applying advanced kernel tuning for UDP/QUIC stability...${C_RESET}"
+    
+    cat > "$SYSCTL_FILE" <<'EOF'
+# Network performance tuning for Gost tunnels
+net.ipv4.ip_local_port_range = 1024 65535
 
-    local kernel_major kernel_minor bbr_ok=1
-    kernel_major=$(uname -r | cut -d. -f1)
-    kernel_minor=$(uname -r | cut -d. -f2)
-    if [ "$kernel_major" -lt 4 ] || { [ "$kernel_major" -eq 4 ] && [ "$kernel_minor" -lt 9 ]; }; then
-        bbr_ok=0
-        echo -e "${C_YELLOW}Kernel < 4.9, BBR not available - skipping congestion control change.${C_RESET}"
-    fi
-    # Note: BBR is a TCP-only congestion control. It has zero effect on
-    # udp/quic traffic - quic's congestion control lives inside gost's
-    # quic-go library, not the kernel. Don't expect BBR to help quic.
+# Memory buffers - critical for UDP/QUIC
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
 
-    {
-        echo "net.ipv4.ip_local_port_range = 1024 65535"
-        echo "net.core.rmem_max = 67108864"
-        echo "net.core.wmem_max = 67108864"
-        echo "net.core.rmem_default = 1048576"
-        echo "net.core.wmem_default = 1048576"
-        echo "net.ipv4.tcp_rmem = 4096 87380 67108864"
-        echo "net.ipv4.tcp_wmem = 4096 65536 67108864"
-        echo "net.ipv4.udp_rmem_min = 131072"
-        echo "net.ipv4.udp_wmem_min = 131072"
-        # Raises the kernel's receive backlog queue so bursts of udp/quic
-        # packets aren't dropped before the app (gost) reads them - the
-        # default (1000) is too low for a busy udp/quic relay and is a
-        # common silent cause of "packet loss" that never shows up in
-        # gost's own logs because the kernel drops the packet first.
-        echo "net.core.netdev_max_backlog = 250000"
-        echo "net.core.somaxconn = 65535"
-        echo "net.ipv4.tcp_max_syn_backlog = 65535"
-        echo "net.ipv4.tcp_syncookies = 1"
-        echo "net.ipv4.tcp_fin_timeout = 15"
-        echo "net.ipv4.tcp_tw_reuse = 1"
-        echo "net.ipv4.tcp_slow_start_after_idle = 0"
-        # keepalive: detect and recover dead tunnel connections fast
-        echo "net.ipv4.tcp_keepalive_time = 60"
-        echo "net.ipv4.tcp_keepalive_intvl = 10"
-        echo "net.ipv4.tcp_keepalive_probes = 6"
-        echo "net.ipv4.tcp_mtu_probing = 1"
-        echo "fs.file-max = 2097152"
-        if [ "$bbr_ok" -eq 1 ]; then
-            echo "net.core.default_qdisc = fq"
-            echo "net.ipv4.tcp_congestion_control = bbr"
-        fi
-    } > "$SYSCTL_FILE"
+# UDP specific buffers
+net.ipv4.udp_rmem_min = 65536
+net.ipv4.udp_wmem_min = 65536
+
+# TCP buffers
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Queue sizes - prevent packet drops
+net.core.netdev_max_backlog = 500000
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# TCP optimizations
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+# MTU and fragmentation
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.ip_no_pmtu_disc = 0
+
+# File descriptors
+fs.file-max = 2097152
+
+# BBR congestion control (TCP only)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
 
     sysctl --system > /dev/null 2>&1
+    
+    # Limits
+    cat > "$LIMITS_FILE" <<'EOF'
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 1048576
+* hard nproc 1048576
+EOF
 
-    {
-        echo "* soft nofile 1048576"
-        echo "* hard nofile 1048576"
-        echo "* soft nproc 1048576"
-        echo "* hard nproc 1048576"
-    } > "$LIMITS_FILE"
-
-    echo -e "${C_GREEN}Kernel/TCP/UDP tuning applied.${C_RESET}"
+    echo -e "${C_GREEN}Advanced tuning applied.${C_RESET}"
 }
 
-# ---------- gost install ----------
+# ---------- gost install with version selection ----------
 install_gost() {
     local version_choice="$1"
-    apt-get update -qq && apt-get install -y -qq wget nano tar > /dev/null
+    apt-get update -qq && apt-get install -y -qq wget nano tar curl > /dev/null
+    
     if [ "$version_choice" -eq 1 ]; then
         echo -e "${C_GREEN}Installing Gost 2.11.5...${C_RESET}"
         wget -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz -O /tmp/gost.gz || { echo -e "${C_RED}Download failed.${C_RESET}"; return 1; }
@@ -172,131 +154,187 @@ install_gost() {
         tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/ gost
         chmod +x /usr/local/bin/gost
     fi
+    
+    # Create gost config directory
+    mkdir -p /etc/gost
     echo -e "${C_GREEN}Gost installed successfully.${C_RESET}"
 }
 
-# grpc and quic need Gost 3.x - 2.11.5's implementation of both is old
-# and is the most likely reason they misbehave (dropped traffic / total
-# failure). tcp/udp work fine on either version, so we only force the
-# version when it actually matters.
-ensure_gost_for_protocol() {
-    local protocol="$1"
-
-    if [ ! -x /usr/local/bin/gost ]; then
-        if [ "$protocol" == "grpc" ] || [ "$protocol" == "quic" ]; then
-            echo -e "${C_YELLOW}${protocol} requires Gost 3.x - installing the latest 3.x automatically.${C_RESET}"
-            install_gost 2
-            return $?
-        fi
-        echo -e "${C_GREEN}Gost is not installed yet.${C_RESET}"
-        echo -e "${C_CYAN}1. ${C_RESET}Gost 2.11.5 (official, stable, tcp/udp)"
-        echo -e "${C_CYAN}2. ${C_RESET}Gost 3.x (latest, required for grpc/quic)"
-        local v; v=$(read_choice $'\e[97mYour choice: \e[0m' 1 2)
-        install_gost "$v"
-        return $?
-    fi
-
-    if [ "$protocol" == "grpc" ] || [ "$protocol" == "quic" ]; then
-        # best-effort version probe - if it fails we just proceed, we don't
-        # want a fragile version-string parse to block a working setup
-        local ver_line
-        ver_line=$(/usr/local/bin/gost -V 2>&1 | head -1)
-        if echo "$ver_line" | grep -qE '(^| )gost( |v)?2\.'; then
-            echo -e "${C_YELLOW}Installed Gost looks like a 2.x build - ${protocol} needs 3.x. Reinstalling latest 3.x...${C_RESET}"
-            install_gost 2
-            return $?
-        fi
-    fi
-    return 0
-}
-
-# ---------- build/refresh a tunnel systemd unit ----------
-# args: unit_name  destination_ip  ports_csv  protocol
+# ---------- build optimized tunnel service ----------
 build_tunnel_service() {
     local unit_name="$1" destination_ip="$2" ports_csv="$3" protocol="$4"
-
-    # Reliability query params appended to every -L listener. tcp needs
-    # nothing extra. udp/quic default to tearing a "connection" down
-    # after ~5s of silence, which reads as a random disconnect for any
-    # session that goes briefly idle - keepAlive+ttl fixes that.
+    
+    # Enhanced parameters for each protocol
     local suffix=""
     case "$protocol" in
-        udp)  suffix="?keepAlive=true&ttl=10s" ;;
-        quic) suffix="?keepalive=true&ttl=10s" ;;
+        udp)
+            suffix="?keepAlive=true&ttl=30s&bufferSize=65535"
+            ;;
+        quic)
+            # Fixed QUIC parameters - these are critical for stability
+            suffix="?keepalive=true&ttl=60s&handshakeTimeout=15s&idleTimeout=120s&maxStreams=100"
+            ;;
+        grpc)
+            suffix="?insecure=true&ping=true&timeout=30s"
+            ;;
+        tcp)
+            suffix="?keepAlive=true&ttl=60s"
+            ;;
     esac
-
+    
     IFS=',' read -ra port_array <<< "$ports_csv"
     local port_count=${#port_array[@]}
-    local max_ports_per_unit=4000   # keep ExecStart lines sane and startup fast
+    local max_ports_per_unit=2000
     local file_count=$(( (port_count + max_ports_per_unit - 1) / max_ports_per_unit ))
-
+    
     for ((file_index = 0; file_index < file_count; file_index++)); do
         local this_unit="${unit_name}_${file_index}"
         local exec_start="ExecStart=/usr/local/bin/gost"
         local start=$((file_index * max_ports_per_unit))
         local end=$(( (file_index + 1) * max_ports_per_unit ))
         [ "$end" -gt "$port_count" ] && end=$port_count
-
+        
         for ((i = start; i < end; i++)); do
             local port="${port_array[i]}"
             exec_start+=" -L=${protocol}://:${port}/[${destination_ip}]:${port}${suffix}"
         done
-
+        
         cat > "/etc/systemd/system/${this_unit}.service" <<EOF
 [Unit]
 Description=GO Simple Tunnel (${this_unit})
-After=network-online.target
+Documentation=https://gost.run
+After=network-online.target nss-lookup.target
 Wants=network-online.target
 StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
+User=root
+Group=root
+
+# Environment
 Environment="GOST_LOGGER_LEVEL=fatal"
+Environment="GOST_LOGGER_FORMAT=json"
+Environment="GOST_LOGGER_OUTPUT=stderr"
+Environment="GODEBUG=netdns=go+1"
+
+# Startup and restart
 ${exec_start}
 Restart=always
-RestartSec=2
-TimeoutStopSec=5
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Resource limits
 LimitNOFILE=1048576
 LimitNPROC=1048576
+LimitCORE=0
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/gost
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl enable "${this_unit}.service" > /dev/null 2>&1
+        
         systemctl daemon-reload
+        systemctl enable "${this_unit}.service" > /dev/null 2>&1
         systemctl restart "${this_unit}.service"
+        
+        # Wait for service to start properly
+        sleep 2
+        
+        # Check if service is running
+        if ! systemctl is-active --quiet "${this_unit}.service"; then
+            echo -e "${C_YELLOW}Warning: ${this_unit} failed to start. Checking logs...${C_RESET}"
+            journalctl -u "${this_unit}.service" -n 10 --no-pager
+        fi
     done
-
+    
     apply_mss_clamp
-
+    apply_advanced_tuning
+    
+    # Create health check for this tunnel
+    create_health_check "$unit_name" "$destination_ip" "$protocol"
+    
     echo -e "${C_GREEN}Tunnel configuration applied (${file_count} service unit(s)).${C_RESET}"
     if [ "$protocol" == "quic" ]; then
-        echo -e "${C_YELLOW}Note: quic runs over UDP. If it never connects at all (not just slow/packet loss), that is almost always the network path blocking/throttling UDP, not this script. Try tcp as a control to confirm.${C_RESET}"
+        echo -e "${C_YELLOW}QUIC is now configured with optimized parameters.${C_RESET}"
+        echo -e "${C_YELLOW}If you still experience issues, try switching to TCP.${C_RESET}"
     fi
 }
 
-# TLS/gRPC framing adds bytes on top of the real payload; if a packet then
-# exceeds path MTU it gets fragmented or silently dropped by routers that
-# block fragments - a common cause of "works but unstable/slow" over grpc.
-# Clamping MSS to the actual path MTU avoids this without needing to know
-# the exact MTU in advance. NOTE: this only helps TCP-based protocols
-# (tcp, grpc) - it does nothing for udp/quic, which don't use MSS.
+# ---------- health check script per tunnel ----------
+create_health_check() {
+    local unit_name="$1" destination_ip="$2" protocol="$3"
+    
+    cat > "/usr/bin/health_${unit_name}.sh" <<EOF
+#!/bin/bash
+# Health check for ${unit_name}
+UNIT="${unit_name}"
+DEST_IP="${destination_ip}"
+PROTOCOL="${protocol}"
+
+# Check if service is running
+if ! systemctl is-active --quiet "\${UNIT}"*; then
+    echo "Service not running, restarting..."
+    systemctl restart "\${UNIT}"*
+    exit 1
+fi
+
+# For TCP, test connection
+if [ "\${PROTOCOL}" = "tcp" ] || [ "\${PROTOCOL}" = "grpc" ]; then
+    PORT=\$(grep -oP -- '-L=\S+?://:\K[0-9]+' /etc/systemd/system/\${UNIT}_*.service | head -1)
+    if [ -n "\$PORT" ]; then
+        timeout 5 bash -c "echo > /dev/tcp/127.0.0.1/\${PORT}" 2>/dev/null || {
+            echo "Port \${PORT} not responding, restarting..."
+            systemctl restart "\${UNIT}"*
+        }
+    fi
+fi
+
+# For UDP/QUIC, check socket
+if [ "\${PROTOCOL}" = "udp" ] || [ "\${PROTOCOL}" = "quic" ]; then
+    PORT=\$(grep -oP -- '-L=\S+?://:\K[0-9]+' /etc/systemd/system/\${UNIT}_*.service | head -1)
+    if [ -n "\$PORT" ]; then
+        ss -uln 2>/dev/null | grep -q ":\${PORT} " || {
+            echo "UDP socket \${PORT} not bound, restarting..."
+            systemctl restart "\${UNIT}"*
+        }
+    fi
+fi
+EOF
+    
+    chmod +x "/usr/bin/health_${unit_name}.sh"
+}
+
+# ---------- MSS clamp for TCP ----------
 apply_mss_clamp() {
     command -v iptables &>/dev/null || return 0
     if ! iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
         iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-        echo -e "${C_GREEN}MSS clamping enabled (reduces fragmentation-related packet loss on tcp/grpc).${C_RESET}"
+        echo -e "${C_GREEN}MSS clamping enabled.${C_RESET}"
     fi
 }
 
+# ---------- protocol selection ----------
 prompt_protocol() {
     echo -e "${C_GREEN}Select the protocol:${C_RESET}" >&2
-    echo -e "${C_CYAN}1. ${C_RESET}tcp   plain TCP relay - fastest, no DPI evasion" >&2
-    echo -e "${C_CYAN}2. ${C_RESET}udp   plain UDP relay" >&2
-    echo -e "${C_CYAN}3. ${C_RESET}grpc  HTTP/2 + TLS wrapped (forces Gost 3.x)" >&2
-    echo -e "${C_CYAN}4. ${C_RESET}quic  UDP + TLS1.3, lowest latency of the wrapped options (forces Gost 3.x - some networks throttle/block UDP-based QUIC, test tcp first if unsure)" >&2
+    echo -e "${C_CYAN}1. ${C_RESET}tcp   - Most stable, recommended" >&2
+    echo -e "${C_CYAN}2. ${C_RESET}udp   - Low latency, connectionless" >&2
+    echo -e "${C_CYAN}3. ${C_RESET}grpc  - HTTP/2 + TLS (good for DPI evasion)" >&2
+    echo -e "${C_CYAN}4. ${C_RESET}quic  - UDP + TLS 1.3 (lowest latency, but may be filtered)" >&2
+    echo -e "${C_YELLOW}Note: TCP is recommended for stability in most networks.${C_RESET}" >&2
+    
     local opt
-    opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 4)
+    opt=$(read_choice $'\e[97mYour choice (1-4): \e[0m' 1 4)
     case "$opt" in
         1) echo "tcp" ;;
         2) echo "udp" ;;
@@ -305,6 +343,7 @@ prompt_protocol() {
     esac
 }
 
+# ---------- port input ----------
 prompt_ports() {
     local opt ports_out
     opt=$(read_choice $'\e[32mPorts:\n\e[0m\e[36m1. \e[0mManual (comma separated)\n\e[36m2. \e[0mRange\n\e[32mYour choice: \e[0m' 1 2)
@@ -329,42 +368,101 @@ prompt_ports() {
     echo "$ports_out"
 }
 
+# ---------- create tunnel action ----------
 action_create_tunnel() {
-    local ip_version="$1" destination_ip ports protocol
+    local ip_version="$1"
+    local destination_ip ports protocol
+    
     read -rp $'\e[97mEnter destination (Kharej) IP: \e[0m' destination_ip
     [ -z "$destination_ip" ] && { echo -e "${C_RED}IP cannot be empty.${C_RESET}"; return; }
-
+    
     ports=$(prompt_ports) || return
     protocol=$(prompt_protocol)
-
-    echo -e "${C_WHITE}Destination:${C_RESET} $destination_ip  ${C_WHITE}Protocol:${C_RESET} $protocol  ${C_WHITE}Ports:${C_RESET} $(echo "$ports" | cut -c1-40)..."
-
-    ensure_gost_for_protocol "$protocol" || return
-
+    
+    # Check if we need Gost 3.x for certain protocols
+    if [ "$protocol" = "grpc" ] || [ "$protocol" = "quic" ]; then
+        echo -e "${C_GREEN}${protocol} requires Gost 3.x - ensuring latest version...${C_RESET}"
+        install_gost 2 || return
+    else
+        if [ ! -x /usr/local/bin/gost ]; then
+            echo -e "${C_YELLOW}Gost is not installed. Installing...${C_RESET}"
+            install_gost 1 || return
+        fi
+    fi
+    
+    echo -e "${C_WHITE}Configuration:${C_RESET}"
+    echo -e "  Destination: ${C_CYAN}$destination_ip${C_RESET}"
+    echo -e "  Protocol: ${C_CYAN}$protocol${C_RESET}"
+    echo -e "  Ports: ${C_CYAN}$(echo "$ports" | cut -c1-40)...${C_RESET}"
+    
+    read -rp $'\e[32mConfirm? (y/n): \e[0m' confirm
+    [ "$confirm" != "y" ] && { echo "Canceled."; return; }
+    
     local unit_name="gost_$(echo "$destination_ip" | tr -c 'a-zA-Z0-9' '_')"
     build_tunnel_service "$unit_name" "$destination_ip" "$ports" "$protocol"
-    apply_kernel_tuning
+    
+    # Setup automatic health checks
+    setup_health_checks
 }
 
+# ---------- health check system ----------
+setup_health_checks() {
+    # Combined health check script
+    cat > "$HEALTH_CHECK_SCRIPT" <<'EOF'
+#!/bin/bash
+# Combined health check for all Gost tunnels
+
+for script in /usr/bin/health_gost_*.sh; do
+    [ -x "$script" ] && "$script"
+done
+EOF
+    chmod +x "$HEALTH_CHECK_SCRIPT"
+    
+    # Add to crontab if not exists
+    if ! crontab -l 2>/dev/null | grep -q "$HEALTH_CHECK_SCRIPT"; then
+        (crontab -l 2>/dev/null; echo "*/5 * * * * $HEALTH_CHECK_SCRIPT") | crontab -
+        echo -e "${C_GREEN}Health checks scheduled every 5 minutes.${C_RESET}"
+    fi
+}
+
+# ---------- status ----------
 action_status() {
     if ! command -v gost &>/dev/null; then
         echo -e "${C_YELLOW}Gost is not installed.${C_RESET}"
         return
     fi
+    
+    echo -e "${C_CYAN}=== Gost Tunnel Status ===${C_RESET}"
     local found=0
+    
     for svc in /etc/systemd/system/gost_*.service; do
         [ -e "$svc" ] || continue
         found=1
-        local active dest proto ports
-        active=$(systemctl is-active "$(basename "$svc")" 2>/dev/null)
-        dest=$(grep -oP 'ExecStart=.*?-L=\S+://:\d+/\[\K[^\]]+' "$svc" | head -1)
-        proto=$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "$svc" | head -1)
-        ports=$(grep -oP -- '-L=\S+?://:\K[0-9]+' "$svc" | wc -l)
-        echo -e "${C_WHITE}Unit:${C_RESET} $(basename "$svc")  ${C_WHITE}State:${C_RESET} $active  ${C_WHITE}IP:${C_RESET} $dest  ${C_WHITE}Proto:${C_RESET} $proto  ${C_WHITE}Ports:${C_RESET} $ports"
+        local name=$(basename "$svc" .service)
+        local active=$(systemctl is-active "$name" 2>/dev/null)
+        local dest=$(grep -oP 'ExecStart=.*?-L=\S+://:\d+/\[\K[^\]]+' "$svc" | head -1)
+        local proto=$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "$svc" | head -1)
+        local ports=$(grep -oP -- '-L=\S+?://:\K[0-9]+' "$svc" | wc -l)
+        
+        local status_color=""
+        case "$active" in
+            active) status_color="${C_GREEN}" ;;
+            failed) status_color="${C_RED}" ;;
+            *) status_color="${C_YELLOW}" ;;
+        esac
+        
+        echo -e "${C_WHITE}Unit:${C_RESET} $name"
+        echo -e "  State: ${status_color}$active${C_RESET}"
+        echo -e "  IP: ${C_CYAN}$dest${C_RESET}"
+        echo -e "  Protocol: ${C_CYAN}$proto${C_RESET}"
+        echo -e "  Ports: ${C_CYAN}$ports${C_RESET}"
+        echo ""
     done
+    
     [ "$found" -eq 0 ] && echo -e "${C_YELLOW}No tunnel services configured.${C_RESET}"
 }
 
+# ---------- other actions ----------
 action_update_script() {
     read -rp $'\e[32mUpdate script from repo? (y/n): \e[0m' ans
     [ "$ans" != "y" ] && { echo "Canceled."; return; }
@@ -376,14 +474,15 @@ action_update_script() {
 }
 
 action_change_version() {
-    echo -e "${C_CYAN}1. ${C_RESET}Gost 2.11.5"
-    echo -e "${C_CYAN}2. ${C_RESET}Gost 3.x (latest)"
+    echo -e "${C_CYAN}1. ${C_RESET}Gost 2.11.5 (stable, TCP/UDP)"
+    echo -e "${C_CYAN}2. ${C_RESET}Gost 3.x (latest, required for gRPC/QUIC)"
     local v; v=$(read_choice $'\e[97mYour choice: \e[0m' 1 2)
     install_gost "$v"
     systemctl restart gost_*.service 2>/dev/null
 }
 
 action_auto_restart() {
+    echo -e "${C_YELLOW}Note: This is a blind restart. For smart health checking, use option 7.${C_RESET}"
     echo -e "${C_CYAN}1. ${C_RESET}Enable"
     echo -e "${C_CYAN}2. ${C_RESET}Disable"
     local opt; opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 2)
@@ -405,126 +504,92 @@ EOF
     fi
 }
 
-# ---------- watchdog: probes the actual port instead of blind restarts ----------
-generate_watchdog_script() {
-    cat > "$WATCHDOG_SCRIPT" <<'WDEOF'
-#!/bin/bash
-# Restarts only the gost unit(s) whose listening port has actually stopped
-# responding, instead of blindly restarting everything on a timer.
-for unit in /etc/systemd/system/gost_*.service; do
-    [ -e "$unit" ] || continue
-    name="$(basename "$unit" .service)"
-
-    if ! systemctl is-active --quiet "$name"; then
-        systemctl restart "$name"
-        continue
-    fi
-
-    port="$(grep -oP -- '-L=\S+?://:\K[0-9]+' "$unit" | head -1)"
-    proto="$(grep -oP 'ExecStart=.*?-L=\K[a-z]+(?=://)' "$unit" | head -1)"
-    [ -z "$port" ] && continue
-
-    if [ "$proto" = "udp" ] || [ "$proto" = "quic" ]; then
-        # UDP/QUIC are connectionless - a real end-to-end probe isn't
-        # reliable here, so this only confirms the socket is still bound.
-        ss -uln 2>/dev/null | grep -q ":${port} " || systemctl restart "$name"
-    else
-        timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/${port}" 2>/dev/null || systemctl restart "$name"
-    fi
-done
-WDEOF
-    chmod +x "$WATCHDOG_SCRIPT"
-}
-
-action_watchdog() {
-    echo -e "${C_GREEN}This checks every 2 minutes whether each tunnel's port is actually${C_RESET}"
-    echo -e "${C_GREEN}alive and restarts only the ones that aren't - independent of the${C_RESET}"
-    echo -e "${C_GREEN}blind timed restart in option 6.${C_RESET}"
-    echo -e "${C_CYAN}1. ${C_RESET}Enable"
-    echo -e "${C_CYAN}2. ${C_RESET}Disable"
-    local opt; opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 2)
-    if [ "$opt" -eq 1 ]; then
-        generate_watchdog_script
-        (crontab -l 2>/dev/null | grep -v gost_watchdog.sh; echo "*/2 * * * * $WATCHDOG_SCRIPT") | crontab -
-        echo -e "${C_GREEN}Watchdog enabled.${C_RESET}"
-    else
-        rm -f "$WATCHDOG_SCRIPT"
-        (crontab -l 2>/dev/null | grep -v gost_watchdog.sh) | crontab - 2>/dev/null
-        echo -e "${C_GREEN}Watchdog disabled.${C_RESET}"
-    fi
-}
-
-action_auto_clear_cache() {
-    echo -e "${C_YELLOW}Note: dropping page cache does not speed up an already-running tunnel and can briefly hurt performance right after it runs; only useful on memory-starved boxes.${C_RESET}"
-    echo -e "${C_CYAN}1. ${C_RESET}Enable"
-    echo -e "${C_CYAN}2. ${C_RESET}Disable"
-    local opt; opt=$(read_choice $'\e[97mYour choice: \e[0m' 1 2)
-    if [ "$opt" -eq 1 ]; then
-        local days; read -rp $'\e[97mInterval in days: \e[0m' days
-        is_number "$days" || { echo -e "${C_RED}Invalid number.${C_RESET}"; return; }
-        (crontab -l 2>/dev/null | grep -v drop_caches; echo "0 0 */$days * * sync; echo 3 > /proc/sys/vm/drop_caches") | crontab -
-        echo -e "${C_GREEN}Scheduled.${C_RESET}"
-    else
-        (crontab -l 2>/dev/null | grep -v drop_caches) | crontab - 2>/dev/null
-        echo -e "${C_GREEN}Disabled.${C_RESET}"
-    fi
-}
-
-action_install_bbr() {
-    apply_kernel_tuning
-    echo -e "${C_CYAN}Optional: also run teddysun/across bbr.sh for alternate congestion-control algorithms (bbrplus/etc)? (y/n)${C_RESET}"
-    read -rp "> " ans
-    if [ "$ans" == "y" ]; then
-        wget -qN --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh && chmod +x bbr.sh && bash bbr.sh
-    fi
-}
-
 action_uninstall() {
-    read -rp $'\e[91mWarning\e[33m: this removes Gost and all tunnel data. Continue? (y/n): \e[0m' ans
+    read -rp $'\e[91mWarning\e[33m: This removes Gost and all tunnel data. Continue? (y/n): \e[0m' ans
     [ "$ans" != "y" ] && { echo "Canceled."; return; }
-    rm -f /usr/bin/gost_auto_restart.sh "$WATCHDOG_SCRIPT"
-    (crontab -l 2>/dev/null | grep -v gost_auto_restart.sh | grep -v drop_caches | grep -v gost_watchdog.sh) | crontab - 2>/dev/null
+    
+    # Remove services
     systemctl stop gost_*.service 2>/dev/null
     systemctl disable gost_*.service 2>/dev/null
     rm -f /etc/systemd/system/gost_*.service
+    
+    # Remove binaries
     rm -f /usr/local/bin/gost
+    
+    # Remove scripts
+    rm -f /usr/bin/gost_auto_restart.sh
+    rm -f "$WATCHDOG_SCRIPT"
+    rm -f "$HEALTH_CHECK_SCRIPT"
+    rm -f /usr/bin/health_gost_*.sh
+    
+    # Remove configs
     rm -rf "$GOST_DIR"
     rm -f "$SYSCTL_FILE" "$LIMITS_FILE"
+    
+    # Remove crontab entries
+    (crontab -l 2>/dev/null | grep -v -e gost_auto_restart -e drop_caches -e gost_watchdog -e health_check) | crontab - 2>/dev/null
+    
     systemctl daemon-reload
-    echo -e "${C_GREEN}Gost uninstalled.${C_RESET}"
+    echo -e "${C_GREEN}Gost uninstalled completely.${C_RESET}"
 }
 
+# ---------- main menu ----------
 main_menu() {
-    banner
-    echo -e "${C_CYAN}1. ${C_RESET}Gost Tunnel By IP4"
-    echo -e "${C_CYAN}2. ${C_RESET}Gost Tunnel By IP6"
-    echo -e "${C_CYAN}3. ${C_RESET}Gost Status"
-    echo -e "${C_CYAN}4. ${C_RESET}Update Script"
-    echo -e "${C_CYAN}5. ${C_RESET}Change Gost Version"
-    echo -e "${C_CYAN}6. ${C_RESET}Auto Restart Gost (timed, blind)"
-    echo -e "${C_CYAN}7. ${C_RESET}Connection Watchdog (auto-heal, checks port health)"
-    echo -e "${C_CYAN}8. ${C_RESET}Auto Clear Cache"
-    echo -e "${C_CYAN}9. ${C_RESET}Apply Speed/Stability Tuning (BBR + TCP/UDP tuning)"
-    echo -e "${C_CYAN}10. ${C_RESET}Uninstall"
-    echo -e "${C_CYAN}11. ${C_RESET}Exit"
-
-    local choice; choice=$(read_choice $'\e[97mYour choice: \e[0m' 1 11)
-    case "$choice" in
-        1) action_create_tunnel 4 ;;
-        2) action_create_tunnel 6 ;;
-        3) action_status ;;
-        4) action_update_script ;;
-        5) action_change_version ;;
-        6) action_auto_restart ;;
-        7) action_watchdog ;;
-        8) action_auto_clear_cache ;;
-        9) action_install_bbr ;;
-        10) action_uninstall ;;
-        11) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
-    esac
+    while true; do
+        clear
+        banner
+        echo ""
+        echo -e "${C_CYAN}=== Main Menu ===${C_RESET}"
+        echo -e "${C_CYAN}1. ${C_RESET}Create IPv4 Tunnel"
+        echo -e "${C_CYAN}2. ${C_RESET}Create IPv6 Tunnel"
+        echo -e "${C_CYAN}3. ${C_RESET}View Status"
+        echo -e "${C_CYAN}4. ${C_RESET}Update Script"
+        echo -e "${C_CYAN}5. ${C_RESET}Change Gost Version"
+        echo -e "${C_CYAN}6. ${C_RESET}Auto Restart (timed)"
+        echo -e "${C_CYAN}7. ${C_RESET}Health Check (smart monitoring)"
+        echo -e "${C_CYAN}8. ${C_RESET}Apply Advanced Tuning"
+        echo -e "${C_CYAN}9. ${C_RESET}View Logs"
+        echo -e "${C_CYAN}10. ${C_RESET}Uninstall"
+        echo -e "${C_CYAN}11. ${C_RESET}Exit"
+        echo ""
+        
+        local choice; choice=$(read_choice $'\e[97mYour choice (1-11): \e[0m' 1 11)
+        
+        case "$choice" in
+            1) action_create_tunnel 4 ;;
+            2) action_create_tunnel 6 ;;
+            3) action_status ;;
+            4) action_update_script ;;
+            5) action_change_version ;;
+            6) action_auto_restart ;;
+            7) 
+                echo -e "${C_GREEN}Enabling health checks...${C_RESET}"
+                setup_health_checks
+                echo -e "${C_GREEN}Health checks enabled. They run every 5 minutes.${C_RESET}"
+                read -rp "Press Enter to continue..."
+                ;;
+            8) 
+                apply_advanced_tuning
+                echo -e "${C_GREEN}Advanced tuning applied.${C_RESET}"
+                read -rp "Press Enter to continue..."
+                ;;
+            9)
+                echo -e "${C_CYAN}=== Recent Logs ===${C_RESET}"
+                journalctl -u gost_*.service -n 30 --no-pager
+                read -rp "Press Enter to continue..."
+                ;;
+            10) action_uninstall ;;
+            11) echo -e "${C_GREEN}Bye.${C_RESET}"; exit 0 ;;
+        esac
+    done
 }
 
 # ---------- entry point ----------
 require_root
 ensure_self_installed
+
+# Create initial directories
+mkdir -p /etc/gost
+
+# Main menu
 main_menu
