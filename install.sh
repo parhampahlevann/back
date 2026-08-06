@@ -161,46 +161,73 @@ apply_kernel_tuning() {
 }
 
 # ---------- gost install ----------
-# IMPORTANT: every network call here has an explicit timeout. Without one,
-# a stalled/throttled connection to GitHub (very common when this runs on
-# a server with restricted/filtered international access) hangs forever
-# and looks exactly like the installer "freezing halfway through".
-WGET_OPTS="--timeout=20 --tries=3 --waitretry=2"
+# IMPORTANT: if direct GitHub access from this server is blocked/reset
+# (not just slow), no amount of retrying the direct URL will help. So we
+# fall back through a couple of well-known public GitHub download mirrors.
+# These are third-party services, not run by us or Anthropic - use at
+# your own judgment. Because of that, every downloaded file is checked
+# for a real ELF header before being installed, to catch a mirror
+# silently returning an HTML error page instead of the binary.
+WGET_OPTS="--timeout=20 --tries=2 --waitretry=2"
 CURL_OPTS="--connect-timeout 10 --max-time 25 --retry 2 --retry-delay 2 -s"
+GH_MIRRORS=("" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
+# Used only if the GitHub API itself can't be reached to discover the
+# true latest version - update this occasionally so it doesn't go too stale.
+GOST3_PINNED_VERSION="3.2.6"
+
+is_elf_binary() { [ -f "$1" ] && [ "$(head -c4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; }
+
+# fetch_with_mirrors <url-without-scheme-prefix-issue> <output-path>
+# Tries the URL directly, then through each mirror prefix, in order.
+fetch_with_mirrors() {
+    local url="$1" out="$2" m label
+    for m in "${GH_MIRRORS[@]}"; do
+        label="direct GitHub"; [ -n "$m" ] && label="mirror $m"
+        echo -e "${C_GREEN}Trying ${label}...${C_RESET}"
+        rm -f "$out"
+        if wget $WGET_OPTS -q -O "$out" "${m}${url}" && [ -s "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 install_gost() {
     local version_choice="$1"
     apt-get update -qq && apt-get install -y -qq wget nano tar curl > /dev/null
 
     if [ "$version_choice" -eq 1 ]; then
-        echo -e "${C_GREEN}Downloading Gost 2.11.5 (up to ~60s before it gives up)...${C_RESET}"
-        if ! wget $WGET_OPTS -q https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz -O /tmp/gost.gz; then
-            echo -e "${C_RED}Download failed or timed out. This almost always means this server's connection to github.com is slow/blocked, not a script bug.${C_RESET}"
-            echo -e "${C_YELLOW}If you have a working proxy, export it first: export https_proxy=http://IP:PORT; export http_proxy=http://IP:PORT${C_RESET}"
+        if ! fetch_with_mirrors "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz" /tmp/gost.gz; then
+            echo -e "${C_RED}Download failed on direct GitHub and both mirrors. Your server likely has no usable path to GitHub at all right now.${C_RESET}"
+            echo -e "${C_YELLOW}If you have a working proxy, export it and re-run: export https_proxy=http://IP:PORT; export http_proxy=http://IP:PORT${C_RESET}"
             return 1
         fi
         gunzip -f /tmp/gost.gz
         mv -f /tmp/gost /usr/local/bin/gost
         chmod +x /usr/local/bin/gost
     else
-        echo -e "${C_GREEN}Resolving latest Gost 3.x download URL (up to ~30s before it gives up)...${C_RESET}"
+        echo -e "${C_GREEN}Resolving latest Gost 3.x version via GitHub API...${C_RESET}"
         local download_url
         download_url=$(curl $CURL_OPTS https://api.github.com/repos/go-gost/gost/releases | \
                         grep -oP '"browser_download_url":\s*"\K[^"]+linux_amd64\.tar\.gz' | \
-                        head -n 1)
+                        grep -v amd64v3 | head -n 1)
         if [ -z "$download_url" ]; then
-            echo -e "${C_RED}Could not resolve latest Gost 3.x download URL - either GitHub's API is unreachable/slow from this server, or it's rate-limiting unauthenticated requests.${C_RESET}"
-            echo -e "${C_YELLOW}If you have a working proxy, export it first: export https_proxy=http://IP:PORT; export http_proxy=http://IP:PORT${C_RESET}"
+            echo -e "${C_YELLOW}GitHub API unreachable/rate-limited - falling back to pinned version ${GOST3_PINNED_VERSION}.${C_RESET}"
+            download_url="https://github.com/go-gost/gost/releases/download/v${GOST3_PINNED_VERSION}/gost_${GOST3_PINNED_VERSION}_linux_amd64.tar.gz"
+        fi
+        if ! fetch_with_mirrors "$download_url" /tmp/gost.tar.gz; then
+            echo -e "${C_RED}Download failed on direct GitHub and both mirrors. Your server likely has no usable path to GitHub at all right now.${C_RESET}"
+            echo -e "${C_YELLOW}If you have a working proxy, export it and re-run: export https_proxy=http://IP:PORT; export http_proxy=http://IP:PORT${C_RESET}"
             return 1
         fi
-        echo -e "${C_GREEN}Downloading Gost 3.x (up to ~60s before it gives up)...${C_RESET}"
-        if ! wget $WGET_OPTS -q -O /tmp/gost.tar.gz "$download_url"; then
-            echo -e "${C_RED}Download failed or timed out. This almost always means this server's connection to github.com is slow/blocked, not a script bug.${C_RESET}"
-            return 1
-        fi
-        [ -s /tmp/gost.tar.gz ] || { echo -e "${C_RED}Downloaded file is empty.${C_RESET}"; return 1; }
-        tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/ gost
-        chmod +x /usr/local/bin/gost
+        tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/ gost 2>/dev/null
+        chmod +x /usr/local/bin/gost 2>/dev/null
+    fi
+
+    if ! is_elf_binary /usr/local/bin/gost; then
+        echo -e "${C_RED}The downloaded file isn't a valid binary (likely an error page from a mirror, or a bad archive). Aborting install.${C_RESET}"
+        rm -f /usr/local/bin/gost
+        return 1
     fi
     echo -e "${C_GREEN}Gost installed successfully.${C_RESET}"
 }
